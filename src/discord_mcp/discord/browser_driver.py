@@ -90,6 +90,10 @@ class DiscordBrowserDriver:
             await page.wait_for_timeout(3000)
             await page.evaluate(_SCROLL_GUILDS_JS)
             await page.wait_for_timeout(2000)
+            # Expand any collapsed folders so their nested guilds enter the DOM.
+            # Discord only renders folder children when the folder is open.
+            await page.evaluate(_EXPAND_FOLDERS_JS)
+            await page.wait_for_timeout(1500)
         except Exception as e:
             logger.debug(f"Guild list prep failed (continuing): {e}")
 
@@ -496,6 +500,18 @@ _SCROLL_GUILDS_JS = """
 }
 """
 
+_EXPAND_FOLDERS_JS = """
+() => {
+    // Click any collapsed tree items in the guild nav — those are folders.
+    // Regular guild tiles don't have aria-expanded, so this only hits folders.
+    const folders = document.querySelectorAll(
+        '[data-list-id="guildsnav"] [role="treeitem"][aria-expanded="false"]'
+    );
+    folders.forEach(f => f.click());
+    return folders.length;
+}
+"""
+
 _EXTRACT_GUILDS_JS = """
 () => {
     const guilds = [];
@@ -504,7 +520,9 @@ _EXTRACT_GUILDS_JS = """
         const listItemId = item.getAttribute('data-list-item-id');
         if (!listItemId?.startsWith('guildsnav___') || listItemId === 'guildsnav___home') return;
         const guildId = listItemId.replace('guildsnav___', '');
-        if (!/^[0-9]+$/.test(guildId)) return;
+        // Real Discord snowflakes are 17+ digits. Shorter numeric IDs
+        // (e.g. folder container IDs) should be skipped.
+        if (!/^[0-9]{17,}$/.test(guildId)) return;
         let name = null;
         for (const elem of item.querySelectorAll('*')) {
             const text = elem.textContent?.trim();
