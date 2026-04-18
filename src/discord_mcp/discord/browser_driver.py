@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any, cast
 
 from playwright.async_api import (
     Browser,
@@ -21,6 +22,7 @@ from playwright.async_api import (
 from ..errors import SessionExpired
 from ..logger import logger
 from ..models import Channel, Guild, Message, SessionData, Snowflake, Thread, snowflake
+from .api_client import ApiUnavailable, DiscordApiClient
 
 
 _LOGGED_IN_SELECTOR = '[data-list-id="guildsnav"] [role="treeitem"]'
@@ -42,6 +44,7 @@ class DiscordBrowserDriver:
         self._browser = browser
         self._context = context
         self._page = page
+        self._api = DiscordApiClient(page)
 
     @classmethod
     async def create(
@@ -205,72 +208,65 @@ class DiscordBrowserDriver:
     async def list_pinned(
         self, guild_id: Snowflake, channel_id: Snowflake
     ) -> list[Message]:
-        """Open the pins popout for a channel and scrape its contents."""
-        page = self._page
-        await page.goto(
-            f"https://discord.com/channels/{guild_id}/{channel_id}",
-            wait_until="domcontentloaded",
-        )
-        await page.wait_for_selector(_CHAT_MESSAGES_SELECTOR, timeout=15000)
-
-        pin_btn = await page.query_selector('[aria-label*="Pinned" i]')
-        if pin_btn is None:
-            logger.debug("No Pinned Messages button found; channel may have no pins UI")
+        """List pinned messages via Discord's internal API."""
+        _ = guild_id  # accepted for symmetry; API endpoint is channel-scoped
+        await self._ensure_discord_origin()
+        try:
+            payload = await self._api.fetch_json(f"/api/v9/channels/{channel_id}/pins")
+        except ApiUnavailable as e:
+            logger.debug(f"Pins API failed: {e}")
             return []
-        await pin_btn.click()
-        await page.wait_for_timeout(2000)
-
-        # The pins popover renders message-like rows with the same content
-        # selectors as chat — grab anything with a chat-messages-* id.
-        elements = await page.query_selector_all(
-            '[role="dialog"] [id^="chat-messages-"], [role="menu"] [id^="chat-messages-"]'
-        )
-        if not elements:
-            elements = await page.query_selector_all('[id^="chat-messages-"]')
-
-        messages: list[Message] = []
-        seen: set[str] = set()
-        for el in elements:
-            msg = await _extract_message(el, channel_id)
-            if msg is None or msg.id in seen:
-                continue
-            seen.add(msg.id)
-            messages.append(msg)
-
-        # Close popover to avoid interfering with next call.
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
-        return messages
+        if not isinstance(payload, list):
+            return []
+        items = cast(list[Any], payload)
+        return [_message_from_api(m, channel_id) for m in items]
 
     async def list_threads(
         self, guild_id: Snowflake, channel_id: Snowflake
     ) -> list[Thread]:
-        """Open the threads browser for a channel and scrape active threads."""
-        page = self._page
-        await page.goto(
-            f"https://discord.com/channels/{guild_id}/{channel_id}",
-            wait_until="domcontentloaded",
-        )
-        await page.wait_for_selector(_CHAT_MESSAGES_SELECTOR, timeout=15000)
+        """List active threads parented at `channel_id` via Discord's API.
 
-        threads_btn = await page.query_selector('[aria-label*="Threads" i]')
-        if threads_btn is None:
-            return []
-        await threads_btn.click()
-        await page.wait_for_timeout(2000)
-
-        raw = await page.evaluate(_extract_threads_js(guild_id, channel_id))
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
-
-        return [
-            Thread(
-                id=snowflake(t["id"], field="thread_id"),
-                name=t["name"],
-                parent_channel_id=channel_id,
+        The active-threads endpoint returns every thread in the guild; we
+        filter client-side by parent_id to match the tool's contract.
+        """
+        await self._ensure_discord_origin()
+        try:
+            payload = await self._api.fetch_json(
+                f"/api/v9/guilds/{guild_id}/threads/active"
             )
-            for t in raw
-        ]
+        except ApiUnavailable as e:
+            logger.debug(f"Threads API failed: {e}")
+            return []
+        if not isinstance(payload, dict):
+            return []
+        raw_threads_any = cast(dict[str, Any], payload).get("threads")
+        if not isinstance(raw_threads_any, list):
+            return []
+        raw_threads = cast(list[Any], raw_threads_any)
+
+        results: list[Thread] = []
+        for t in raw_threads:
+            if not isinstance(t, dict):
+                continue
+            t_dict = cast(dict[str, Any], t)
+            if t_dict.get("parent_id") != channel_id:
+                continue
+            raw_id = t_dict.get("id")
+            if not isinstance(raw_id, str):
+                continue
+            try:
+                tid = snowflake(raw_id, field="thread_id")
+            except Exception:
+                continue
+            name = t_dict.get("name")
+            results.append(
+                Thread(
+                    id=tid,
+                    name=name if isinstance(name, str) else f"thread-{tid}",
+                    parent_channel_id=channel_id,
+                )
+            )
+        return results
 
     async def search_messages(
         self,
@@ -280,100 +276,73 @@ class DiscordBrowserDriver:
         channel_id: Snowflake | None,
         limit: int,
     ) -> list[Message]:
-        """Run Discord's server-scoped search and scrape result rows."""
-        page = self._page
-        await page.goto(
-            f"https://discord.com/channels/{guild_id}", wait_until="domcontentloaded"
-        )
-        await page.wait_for_selector(
-            _LOGGED_IN_SELECTOR, state="visible", timeout=15000
-        )
-
-        search_box = await page.query_selector(
-            'input[placeholder*="Search" i], [aria-label*="Search" i]'
-        )
-        if search_box is None:
-            logger.debug("Could not find search input")
+        """Search messages via Discord's guild search API."""
+        await self._ensure_discord_origin()
+        params = [f"content={_url_encode(query)}"]
+        if channel_id is not None:
+            params.append(f"channel_id={channel_id}")
+        path = f"/api/v9/guilds/{guild_id}/messages/search?" + "&".join(params)
+        try:
+            payload = await self._api.fetch_json(path)
+        except ApiUnavailable as e:
+            logger.debug(f"Search API failed: {e}")
             return []
 
-        full_query = query if channel_id is None else f"in:{channel_id} {query}"
-        await search_box.click()
-        await search_box.fill(full_query)
-        await page.keyboard.press("Enter")
-        # Search results render in a side panel; give Discord time.
-        await page.wait_for_timeout(3000)
-
-        elements = await page.query_selector_all(
-            '[class*="searchResultsWrap"] [id^="chat-messages-"], '
-            '[class*="searchResults"] [id^="chat-messages-"]'
+        # Response shape: { messages: [[msg, context1, ...], ...], total_results }
+        raw_groups_any: Any = None
+        if isinstance(payload, dict):
+            raw_groups_any = cast(dict[str, Any], payload).get("messages")
+        raw_groups: list[Any] = (
+            cast(list[Any], raw_groups_any) if isinstance(raw_groups_any, list) else []
         )
-        if not elements:
-            elements = await page.query_selector_all('[id^="chat-messages-"]')
-
-        scope_channel = (
-            channel_id if channel_id is not None else snowflake("0", field="channel_id")
+        placeholder = (
+            channel_id
+            if channel_id is not None
+            else snowflake("0" * 17, field="channel_id")
         )
-        messages: list[Message] = []
+        results: list[Message] = []
         seen: set[str] = set()
-        for el in elements:
-            if len(messages) >= limit:
+        for group_any in raw_groups:
+            if len(results) >= limit:
                 break
-            msg = await _extract_message(el, scope_channel)
-            if msg is None or msg.id in seen:
+            if not isinstance(group_any, list):
+                continue
+            group = cast(list[Any], group_any)
+            match: dict[str, Any] | None = None
+            for item in group:
+                if isinstance(item, dict):
+                    item_dict = cast(dict[str, Any], item)
+                    if item_dict.get("hit"):
+                        match = item_dict
+                        break
+            if match is None and group:
+                first = group[0]
+                if isinstance(first, dict):
+                    match = cast(dict[str, Any], first)
+            if match is None:
+                continue
+            msg = _message_from_api(match, placeholder)
+            if msg.id in seen:
                 continue
             seen.add(msg.id)
-            messages.append(msg)
-
-        return messages
+            results.append(msg)
+        return results
 
     async def list_mentions(self, *, limit: int) -> list[Message]:
-        """Open the @mentions inbox panel and scrape recent mentions."""
-        page = self._page
-        await page.goto(
-            "https://discord.com/channels/@me", wait_until="domcontentloaded"
-        )
-        await page.wait_for_selector(
-            _LOGGED_IN_SELECTOR, state="visible", timeout=15000
-        )
-
-        inbox_btn = await page.query_selector(
-            '[aria-label*="Inbox" i], [aria-label*="mention" i]'
-        )
-        if inbox_btn is None:
-            return []
-        await inbox_btn.click()
-        await page.wait_for_timeout(1000)
-
-        # Click the "Mentions" tab inside the inbox if present.
+        """Fetch recent @mentions via Discord's API."""
+        await self._ensure_discord_origin()
         try:
-            mentions_tab = await page.query_selector(
-                '[role="tab"]:has-text("Mentions")'
+            payload = await self._api.fetch_json(
+                f"/api/v9/users/@me/mentions?limit={limit}"
             )
-            if mentions_tab is not None:
-                await mentions_tab.click()
-                await page.wait_for_timeout(1500)
-        except Exception as e:
-            logger.debug(f"Could not switch to Mentions tab: {e}")
-
-        elements = await page.query_selector_all(
-            '[role="dialog"] [id^="chat-messages-"], [role="menu"] [id^="chat-messages-"]'
-        )
-        # Inbox rows don't carry a channel id; use a placeholder.
-        placeholder_channel = snowflake("0", field="channel_id")
-        messages: list[Message] = []
-        seen: set[str] = set()
-        for el in elements:
-            if len(messages) >= limit:
-                break
-            msg = await _extract_message(el, placeholder_channel)
-            if msg is None or msg.id in seen:
-                continue
-            seen.add(msg.id)
-            messages.append(msg)
-
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(300)
-        return messages
+        except ApiUnavailable as e:
+            logger.debug(f"Mentions API failed: {e}")
+            return []
+        if not isinstance(payload, list):
+            return []
+        items = cast(list[Any], payload)
+        placeholder = snowflake("0" * 17, field="channel_id")
+        return [_message_from_api(m, placeholder) for m in items[:limit]]
 
     async def reply_to_message(
         self,
@@ -458,6 +427,19 @@ class DiscordBrowserDriver:
         await asyncio.sleep(1)
 
     # --------------------------------------------------------------- internal
+
+    async def _ensure_discord_origin(self) -> None:
+        """Ensure the page is on a discord.com origin before an API fetch.
+
+        Discord's `/api/v9/...` endpoints reject requests from other origins,
+        and `fetch()` uses the page's current origin. We pin to @me — cheap
+        if we're already there, one navigation otherwise.
+        """
+        if self._page.url.startswith("https://discord.com/"):
+            return
+        await self._page.goto(
+            "https://discord.com/channels/@me", wait_until="domcontentloaded"
+        )
 
     async def _is_logged_in(self) -> bool:
         page = self._page
@@ -561,31 +543,6 @@ _SCROLL_CHAT_TO_BOTTOM_JS = """
 """
 
 
-def _extract_threads_js(guild_id: Snowflake, channel_id: Snowflake) -> str:
-    """Extract thread links from the Threads popover.
-
-    Both IDs are pre-validated Snowflakes, so interpolating them into the JS
-    regex is safe (they match the numeric pattern).
-    """
-    return f"""
-    (() => {{
-        const threads = [];
-        const seen = new Set();
-        const prefix = '/channels/{guild_id}/';
-        document.querySelectorAll('a[href^="' + prefix + '"]').forEach(link => {{
-            const m = link.href.match(/\\/channels\\/{guild_id}\\/([0-9]+)/);
-            if (!m) return;
-            const id = m[1];
-            if (id === '{channel_id}' || seen.has(id)) return;
-            seen.add(id);
-            const name = (link.textContent || '').trim().replace(/\\s+/g, ' ');
-            threads.push({{ id, name: name || 'thread-' + id }});
-        }});
-        return threads;
-    }})()
-    """
-
-
 def _extract_channels_js(guild_id: Snowflake) -> str:
     # `guild_id` is a Snowflake, so it's already been validated as numeric —
     # safe to interpolate into the JS regex.
@@ -608,12 +565,108 @@ def _extract_channels_js(guild_id: Snowflake) -> str:
     """
 
 
+def _url_encode(s: str) -> str:
+    from urllib.parse import quote
+
+    return quote(s, safe="")
+
+
+def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
+    """Convert a Discord API message object into our domain `Message`.
+
+    Discord responses aren't statically typed in our codebase, so we
+    defensively narrow each field.
+    """
+    if not isinstance(raw, dict):
+        return Message(
+            id="unknown",
+            content="",
+            author_name="Unknown",
+            channel_id=fallback_channel_id,
+            timestamp=datetime.now(timezone.utc),
+            attachments=[],
+        )
+    data = cast(dict[str, Any], raw)
+
+    channel_raw = data.get("channel_id")
+    channel_id = (
+        snowflake(channel_raw, field="channel_id")
+        if isinstance(channel_raw, str) and channel_raw.isdigit()
+        else fallback_channel_id
+    )
+
+    ts_raw = data.get("timestamp")
+    ts = (
+        datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        if isinstance(ts_raw, str)
+        else datetime.now(timezone.utc)
+    )
+
+    attachments: list[str] = []
+    raw_attachments = data.get("attachments")
+    if isinstance(raw_attachments, list):
+        for att in cast(list[Any], raw_attachments):
+            if isinstance(att, dict):
+                url = cast(dict[str, Any], att).get("url")
+                if isinstance(url, str):
+                    attachments.append(url)
+
+    raw_author = data.get("author")
+    if isinstance(raw_author, dict):
+        author = cast(dict[str, Any], raw_author)
+        author_name = author.get("global_name") or author.get("username") or "Unknown"
+        if not isinstance(author_name, str):
+            author_name = "Unknown"
+    else:
+        author_name = "Unknown"
+
+    raw_id = data.get("id")
+    raw_content = data.get("content")
+
+    return Message(
+        id=str(raw_id) if isinstance(raw_id, str) else "unknown",
+        content=raw_content if isinstance(raw_content, str) else "",
+        author_name=author_name,
+        channel_id=channel_id,
+        timestamp=ts,
+        attachments=attachments,
+    )
+
+
+def _split_message_id(
+    trimmed: str, default_channel_id: Snowflake
+) -> tuple[Snowflake, str]:
+    """Parse "channel_id-message_id" → (channel_id, message_id).
+
+    Falls back to `default_channel_id` and a raw id if the prefix doesn't
+    look like a valid snowflake (e.g. when the element has a non-standard id).
+    """
+    if not trimmed:
+        return default_channel_id, "unknown"
+    head, sep, tail = trimmed.partition("-")
+    if sep and head.isdigit() and len(head) >= 17:
+        try:
+            return snowflake(head, field="channel_id"), tail or "unknown"
+        except Exception:
+            pass
+    return default_channel_id, trimmed
+
+
 async def _extract_message(
-    element: ElementHandle, channel_id: Snowflake
+    element: ElementHandle, default_channel_id: Snowflake
 ) -> Message | None:
+    """Scrape a Discord chat-message-looking element into a Message.
+
+    Discord's DOM gives each row an id of the form
+    `chat-messages-{channel_id}-{message_id}`. We parse the channel ID out
+    of the prefix so pinned / search / mention results carry the *real*
+    source channel instead of whatever container we were scraping from.
+    If parsing fails (unexpected format) we fall back to `default_channel_id`.
+    """
     try:
         raw_id = await element.get_attribute("id") or ""
-        msg_id = raw_id.replace("chat-messages-", "") or "unknown"
+        trimmed = raw_id.removeprefix("chat-messages-")
+        channel_id, msg_id = _split_message_id(trimmed, default_channel_id)
 
         content = ""
         for selector in (

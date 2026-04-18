@@ -217,7 +217,12 @@ All configuration is via environment variables (set in your MCP client config or
 
 ## Legal / terms of service
 
-This tool automates a **regular user account** by driving a real browser. That mode of automation is against [Discord's Terms of Service](https://discord.com/terms) (they prohibit "self-bots"). Discord can suspend accounts detected doing this.
+This tool automates a **regular user account** in two ways:
+
+1. **DOM scraping via Playwright** — for listing guilds, channels, and reading channel messages.
+2. **Discord's internal JSON API** (`/api/v9/...`) — for pins, threads, search, and mentions. The tool extracts your session token from the browser and sends authenticated requests to the same endpoints Discord's web client uses.
+
+Both patterns are against [Discord's Terms of Service](https://discord.com/terms) (they prohibit "self-bots"). Calling the internal API directly is the more deliberate violation of the two and carries higher detection risk than scraping.
 
 Use at your own risk, and consider:
 
