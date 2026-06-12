@@ -22,6 +22,7 @@ class Config:
     """Runtime configuration for the MCP server and the CLI."""
 
     session_path: pl.Path
+    cache_path: pl.Path
     keyring_service: str
     keyring_user: str
     headless: bool
@@ -35,7 +36,8 @@ class Config:
             load_dotenv(env_file)
 
         return cls(
-            session_path=_session_path(),
+            session_path=_config_file("session.enc"),
+            cache_path=_config_file("discovery.json"),
             keyring_service=_KEYRING_SERVICE,
             keyring_user=_KEYRING_USER,
             headless=_env_bool("DISCORD_HEADLESS", default=True),
@@ -44,10 +46,10 @@ class Config:
         )
 
 
-def _session_path() -> pl.Path:
+def _config_file(name: str) -> pl.Path:
     xdg = os.getenv("XDG_CONFIG_HOME")
     base = pl.Path(xdg) if xdg else pl.Path.home() / ".config"
-    return base / "discord-mcp" / "session.enc"
+    return base / "discord-mcp" / name
 
 
 def _env_bool(name: str, *, default: bool) -> bool:

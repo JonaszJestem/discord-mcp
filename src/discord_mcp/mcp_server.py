@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -137,26 +138,103 @@ def create_mcp_server(service: DiscordService, config: Config) -> FastMCP:
     @mcp.tool()
     async def search_messages(  # pyright: ignore[reportUnusedFunction]
         server_id: str,
-        query: str,
+        query: str = "",
         limit: int = 25,
         channel_id: str | None = None,
+        author_id: str | None = None,
+        hours_back: int | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
-        """Search messages in a server (optionally scoped to one channel)."""
-        if not query.strip():
-            return _validation_error("query must not be empty")
+        """Search messages in a server, optionally filtered.
+
+        Filters combine: `query` (text), `channel_id` (one channel),
+        `author_id` (a user snowflake), and `hours_back` (only messages newer
+        than N hours). `query` may be empty as long as `author_id` is set.
+        """
+        if not query.strip() and not author_id:
+            return _validation_error("provide a query or an author_id")
         if not 1 <= limit <= MAX_MESSAGES_HARD_LIMIT:
             return _validation_error(
                 f"limit must be between 1 and {MAX_MESSAGES_HARD_LIMIT}"
             )
+        if hours_back is not None and not 1 <= hours_back <= MAX_HOURS_BACK:
+            return _validation_error(
+                f"hours_back must be between 1 and {MAX_HOURS_BACK}"
+            )
         try:
             guild = snowflake(server_id, field="server_id")
             scope = snowflake(channel_id, field="channel_id") if channel_id else None
+            author = snowflake(author_id, field="author_id") if author_id else None
+            after = _cutoff(hours_back)
             messages = await service.search_messages(
-                guild, query, channel_id=scope, limit=limit
+                guild, query, channel_id=scope, limit=limit, author_id=author, after=after
             )
         except DiscordMcpError as e:
             return _to_error(e)
         return [_message_dict(m) for m in messages]
+
+    @mcp.tool()
+    async def get_user_messages(  # pyright: ignore[reportUnusedFunction]
+        server_id: str,
+        author: str,
+        hours_back: int = 24,
+        limit: int = 25,
+        channel_id: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Messages a person posted in a server within the last `hours_back`.
+
+        `author` is a user snowflake (e.g. '125570309171445760') or a username
+        we've already seen in this server (resolved from the local cache).
+        """
+        if not author.strip():
+            return _validation_error("author is required")
+        if not 1 <= limit <= MAX_MESSAGES_HARD_LIMIT:
+            return _validation_error(
+                f"limit must be between 1 and {MAX_MESSAGES_HARD_LIMIT}"
+            )
+        if not 1 <= hours_back <= MAX_HOURS_BACK:
+            return _validation_error(
+                f"hours_back must be between 1 and {MAX_HOURS_BACK}"
+            )
+        resolved = service.resolve_person(author)
+        if resolved is None:
+            return {
+                "error": "user_not_resolved",
+                "message": (
+                    f"'{author}' is not a known user. Pass their numeric Discord "
+                    "ID, or read a channel they've posted in so the cache learns them."
+                ),
+            }
+        try:
+            guild = snowflake(server_id, field="server_id")
+            author_sf = snowflake(resolved, field="author_id")
+            scope = snowflake(channel_id, field="channel_id") if channel_id else None
+            messages = await service.search_messages(
+                guild,
+                "",
+                channel_id=scope,
+                limit=limit,
+                author_id=author_sf,
+                after=_cutoff(hours_back),
+            )
+        except DiscordMcpError as e:
+            return _to_error(e)
+        return [_message_dict(m) for m in messages]
+
+    @mcp.tool()
+    async def resolve_user(  # pyright: ignore[reportUnusedFunction]
+        name: str,
+    ) -> dict[str, Any]:
+        """Resolve a username to a Discord ID from the local discovery cache."""
+        resolved = service.resolve_person(name)
+        if resolved is None:
+            return {"error": "user_not_resolved", "name": name}
+        return {"name": name, "id": resolved}
+
+    @mcp.tool()
+    async def get_known_people(  # pyright: ignore[reportUnusedFunction]
+    ) -> list[dict[str, str]]:
+        """List users discovered so far (id, name, last seen) from the cache."""
+        return service.known_people()
 
     @mcp.tool()
     async def get_mentions(  # pyright: ignore[reportUnusedFunction]
@@ -258,11 +336,18 @@ def _validation_error(message: str) -> dict[str, Any]:
     return {"error": "validation_error", "message": message}
 
 
+def _cutoff(hours_back: int | None) -> datetime | None:
+    if hours_back is None:
+        return None
+    return datetime.now(timezone.utc) - timedelta(hours=hours_back)
+
+
 def _message_dict(m: Message) -> dict[str, Any]:
     return {
         "id": m.id,
         "content": m.content,
         "author_name": m.author_name,
+        "author_id": m.author_id,
         "channel_id": m.channel_id,
         "timestamp": m.timestamp.isoformat(),
         "attachments": m.attachments,

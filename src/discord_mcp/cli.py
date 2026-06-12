@@ -16,6 +16,7 @@ import sys
 from collections.abc import Callable
 
 from .auth import AuthService, EncryptedFileSessionStore, OSKeyringVault, SessionStore
+from .cache import DiscoveryCache
 from .config import Config
 from .discord import BrowserPool, DiscordBrowserDriver, DiscordService
 from .errors import DiscordMcpError
@@ -65,7 +66,7 @@ def _cmd_serve() -> int:
         return await DiscordBrowserDriver.create(session, headless=config.headless)
 
     pool = BrowserPool(factory=driver_factory, max_size=config.pool_size)
-    service = DiscordService(pool)
+    service = DiscordService(pool, DiscoveryCache(config.cache_path))
     create_mcp_server(service, config).run()
     return 0
 

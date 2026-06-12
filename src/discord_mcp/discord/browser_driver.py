@@ -7,6 +7,7 @@ Everything else in the codebase speaks domain types (Guild, Channel, Message).
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -21,12 +22,24 @@ from playwright.async_api import (
 
 from ..errors import SessionExpired
 from ..logger import logger
-from ..models import Channel, Guild, Message, SessionData, Snowflake, Thread, snowflake
+from ..models import (
+    Channel,
+    Guild,
+    Message,
+    SessionData,
+    Snowflake,
+    Thread,
+    snowflake,
+    snowflake_for_time,
+)
 from .api_client import ApiUnavailable, DiscordApiClient
 
 
 _LOGGED_IN_SELECTOR = '[data-list-id="guildsnav"] [role="treeitem"]'
 _CHAT_MESSAGES_SELECTOR = '[data-list-id="chat-messages"]'
+_AVATAR_ID_RE = re.compile(r"/avatars/(\d+)/")
+_SEARCH_PAGE_SIZE = 25  # Discord returns 25 search results per page
+_SEARCH_MAX_PAGES = 40  # safety cap → at most 1000 messages per search
 _MESSAGE_INPUT_SELECTOR = '[data-slate-editor="true"]'
 
 
@@ -275,57 +288,72 @@ class DiscordBrowserDriver:
         *,
         channel_id: Snowflake | None,
         limit: int,
+        author_id: Snowflake | None = None,
+        after: datetime | None = None,
     ) -> list[Message]:
-        """Search messages via Discord's guild search API."""
-        await self._ensure_discord_origin()
-        params = [f"content={_url_encode(query)}"]
-        if channel_id is not None:
-            params.append(f"channel_id={channel_id}")
-        path = f"/api/v9/guilds/{guild_id}/messages/search?" + "&".join(params)
-        try:
-            payload = await self._api.fetch_json(path)
-        except ApiUnavailable as e:
-            logger.debug(f"Search API failed: {e}")
-            return []
+        """Search messages via Discord's guild search API.
 
-        # Response shape: { messages: [[msg, context1, ...], ...], total_results }
-        raw_groups_any: Any = None
-        if isinstance(payload, dict):
-            raw_groups_any = cast(dict[str, Any], payload).get("messages")
-        raw_groups: list[Any] = (
-            cast(list[Any], raw_groups_any) if isinstance(raw_groups_any, list) else []
-        )
+        `author_id` and `after` map to Discord's native `author_id` / `min_id`
+        filters, so the server does the work. `after` is also enforced locally
+        as a safety net against index lag.
+        """
+        await self._ensure_discord_origin()
+        base_params: list[str] = []
+        if query.strip():
+            base_params.append(f"content={_url_encode(query)}")
+        if channel_id is not None:
+            base_params.append(f"channel_id={channel_id}")
+        if author_id is not None:
+            base_params.append(f"author_id={author_id}")
+        if after is not None:
+            base_params.append(f"min_id={snowflake_for_time(after)}")
+        base_params.append("sort_by=timestamp&sort_order=desc")
         placeholder = (
             channel_id
             if channel_id is not None
             else snowflake("0" * 17, field="channel_id")
         )
+
+        # Discord's search returns one page (25 results) per call. Walk pages by
+        # `offset` until we hit `limit`, run past the `after` floor (results are
+        # timestamp-desc, so once one is too old the rest are too), or run dry.
         results: list[Message] = []
         seen: set[str] = set()
-        for group_any in raw_groups:
+        offset = 0
+        for _ in range(_SEARCH_MAX_PAGES):
             if len(results) >= limit:
                 break
-            if not isinstance(group_any, list):
-                continue
-            group = cast(list[Any], group_any)
-            match: dict[str, Any] | None = None
-            for item in group:
-                if isinstance(item, dict):
-                    item_dict = cast(dict[str, Any], item)
-                    if item_dict.get("hit"):
-                        match = item_dict
-                        break
-            if match is None and group:
-                first = group[0]
-                if isinstance(first, dict):
-                    match = cast(dict[str, Any], first)
-            if match is None:
-                continue
-            msg = _message_from_api(match, placeholder)
-            if msg.id in seen:
-                continue
-            seen.add(msg.id)
-            results.append(msg)
+            params = base_params + ([f"offset={offset}"] if offset else [])
+            path = f"/api/v9/guilds/{guild_id}/messages/search?" + "&".join(params)
+            try:
+                payload = await self._api.fetch_json(path)
+            except ApiUnavailable as e:
+                logger.debug(f"Search API failed at offset {offset}: {e}")
+                break
+
+            raw_groups = _search_groups(payload)
+            if not raw_groups:
+                break
+
+            reached_floor = False
+            for group_any in raw_groups:
+                match = _search_hit(group_any)
+                if match is None:
+                    continue
+                msg = _message_from_api(match, placeholder)
+                if msg.id in seen:
+                    continue
+                if after is not None and msg.timestamp <= after:
+                    reached_floor = True
+                    break
+                seen.add(msg.id)
+                results.append(msg)
+                if len(results) >= limit:
+                    break
+
+            if reached_floor or len(raw_groups) < _SEARCH_PAGE_SIZE:
+                break
+            offset += _SEARCH_PAGE_SIZE
         return results
 
     async def list_mentions(self, *, limit: int) -> list[Message]:
@@ -571,6 +599,30 @@ def _url_encode(s: str) -> str:
     return quote(s, safe="")
 
 
+def _search_groups(payload: Any) -> list[Any]:
+    """Pull the `messages` groups out of a search response.
+
+    Response shape: { messages: [[msg, context1, ...], ...], total_results }.
+    """
+    if not isinstance(payload, dict):
+        return []
+    groups = cast(dict[str, Any], payload).get("messages")
+    return cast(list[Any], groups) if isinstance(groups, list) else []
+
+
+def _search_hit(group_any: Any) -> dict[str, Any] | None:
+    """The matched message in a search group — the `hit` item, else the first."""
+    if not isinstance(group_any, list):
+        return None
+    group = cast(list[Any], group_any)
+    for item in group:
+        if isinstance(item, dict) and cast(dict[str, Any], item).get("hit"):
+            return cast(dict[str, Any], item)
+    if group and isinstance(group[0], dict):
+        return cast(dict[str, Any], group[0])
+    return None
+
+
 def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
     """Convert a Discord API message object into our domain `Message`.
 
@@ -611,14 +663,17 @@ def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
                 if isinstance(url, str):
                     attachments.append(url)
 
+    author_name = "Unknown"
+    author_id: str | None = None
     raw_author = data.get("author")
     if isinstance(raw_author, dict):
         author = cast(dict[str, Any], raw_author)
-        author_name = author.get("global_name") or author.get("username") or "Unknown"
-        if not isinstance(author_name, str):
-            author_name = "Unknown"
-    else:
-        author_name = "Unknown"
+        name = author.get("global_name") or author.get("username")
+        if isinstance(name, str):
+            author_name = name
+        aid = author.get("id")
+        if isinstance(aid, str) and aid.isdigit():
+            author_id = aid
 
     raw_id = data.get("id")
     raw_content = data.get("content")
@@ -630,6 +685,7 @@ def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
         channel_id=channel_id,
         timestamp=ts,
         attachments=attachments,
+        author_id=author_id,
     )
 
 
@@ -692,6 +748,16 @@ async def _extract_message(
                 author_name = text.strip()
                 break
 
+        # Best-effort author snowflake: a custom avatar URL is
+        # `.../avatars/{user_id}/{hash}.png`. Default avatars carry no id.
+        author_id: str | None = None
+        avatar = await element.query_selector('img[src*="/avatars/"]')
+        if avatar is not None:
+            src = await avatar.get_attribute("src") or ""
+            match = _AVATAR_ID_RE.search(src)
+            if match:
+                author_id = match.group(1)
+
         ts_el = await element.query_selector("time")
         ts_attr = await ts_el.get_attribute("datetime") if ts_el else None
         ts = (
@@ -716,6 +782,7 @@ async def _extract_message(
             channel_id=channel_id,
             timestamp=ts,
             attachments=attachments,
+            author_id=author_id,
         )
     except Exception as e:
         logger.debug(f"Failed to extract message: {e}")

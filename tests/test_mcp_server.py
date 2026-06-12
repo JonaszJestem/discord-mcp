@@ -1,7 +1,9 @@
 """Tests for the non-Playwright logic in mcp_server: chunking + error formatting."""
 
+from datetime import datetime, timezone
+
 from discord_mcp.errors import InvalidSnowflake, SessionExpired
-from discord_mcp.mcp_server import _chunk_message, _to_error
+from discord_mcp.mcp_server import _chunk_message, _cutoff, _to_error
 
 
 class TestChunkMessage:
@@ -45,3 +47,15 @@ class TestToError:
 
         err = _to_error(DiscordMcpError("boom"))
         assert err["error"] == "DiscordMcpError"
+
+
+class TestCutoff:
+    def test_none_means_no_lower_bound(self):
+        assert _cutoff(None) is None
+
+    def test_returns_past_utc_instant(self):
+        before = datetime.now(timezone.utc)
+        cutoff = _cutoff(24)
+        assert cutoff is not None
+        assert cutoff.tzinfo is not None
+        assert cutoff < before
