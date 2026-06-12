@@ -11,9 +11,18 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 from ..cache import DiscoveryCache
+from ..grouping import split_bursts
 from ..models import Channel, Guild, Message, Snowflake, Thread
 from .browser_driver import DiscordBrowserDriver
 from .browser_pool import BrowserPool
+
+# Deep fan-out reads threads one navigation each, so cap how many we walk.
+MAX_DEEP_THREADS = 20
+# Surrounding-context fetch bounds (include=["context"]).
+CONTEXT_PAD_MINUTES = 5  # widen each burst window by this much either side
+CONTEXT_MAX_BURSTS = 15  # enrich at most this many (largest) bursts
+CONTEXT_WINDOW_LIMIT = 60  # messages fetched per burst window
+CONTEXT_BUDGET = 500  # max surrounding messages added overall
 
 
 class DiscordService:
@@ -102,7 +111,16 @@ class DiscordService:
         limit: int,
         author_id: Snowflake | None = None,
         after: datetime | None = None,
+        deep: bool = False,
+        context: bool = False,
     ) -> list[Message]:
+        """Guild search, optionally augmented by deep fan-out and/or context.
+
+        `deep` reads recent threads via the messages API and merges in the
+        target author's posts that the search index misses. `context` adds the
+        surrounding conversation (what *others* said around each burst). Both
+        only apply when `author_id` is set.
+        """
         messages = await self._with_driver(
             lambda d: d.search_messages(
                 guild_id,
@@ -113,8 +131,77 @@ class DiscordService:
                 after=after,
             )
         )
+        if deep and author_id is not None:
+            thread_messages = await self._with_driver(
+                lambda d: self._deep_thread_messages(
+                    d, guild_id, author_id, after, limit
+                )
+            )
+            messages = _merge_dedupe(messages, thread_messages, limit=limit)
+        if context and author_id is not None:
+            surrounding = await self._with_driver(
+                lambda d: self._context_messages(d, messages)
+            )
+            messages = _merge_with_context(
+                messages, surrounding, budget=CONTEXT_BUDGET
+            )
         self._remember(messages)
         return messages
+
+    async def _context_messages(
+        self, driver: DiscordBrowserDriver, author_messages: list[Message]
+    ) -> list[Message]:
+        """Surrounding channel messages around the author's busiest bursts."""
+        windows: list[tuple[Snowflake, datetime, datetime, int]] = []
+        by_channel: dict[Snowflake, list[Message]] = {}
+        for m in author_messages:
+            by_channel.setdefault(m.channel_id, []).append(m)
+        pad = timedelta(minutes=CONTEXT_PAD_MINUTES)
+        for channel_id, msgs in by_channel.items():
+            for burst in split_bursts(msgs):
+                windows.append(
+                    (channel_id, burst[0].timestamp, burst[-1].timestamp, len(burst))
+                )
+        windows.sort(key=lambda w: w[3], reverse=True)
+
+        out: list[Message] = []
+        for channel_id, start, end, _ in windows[:CONTEXT_MAX_BURSTS]:
+            out.extend(
+                await driver.read_channel_messages_api(
+                    channel_id,
+                    after=start - pad,
+                    before=end + pad,
+                    limit=CONTEXT_WINDOW_LIMIT,
+                )
+            )
+        return out
+
+    async def _deep_thread_messages(
+        self,
+        driver: DiscordBrowserDriver,
+        guild_id: Snowflake,
+        author_id: Snowflake,
+        after: datetime | None,
+        limit: int,
+    ) -> list[Message]:
+        """Author's posts inside recently-active threads (search misses these)."""
+        threads = await driver.list_all_threads(guild_id)
+        active = [
+            t
+            for t in threads
+            if after is None or t.last_activity is None or t.last_activity > after
+        ]
+        active.sort(
+            key=lambda t: t.last_activity or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        out: list[Message] = []
+        for t in active[:MAX_DEEP_THREADS]:
+            msgs = await driver.read_channel_messages_api(
+                t.id, after=after, limit=limit
+            )
+            out.extend(m for m in msgs if m.author_id == author_id)
+        return out
 
     async def list_mentions(self, *, limit: int) -> list[Message]:
         messages = await self._with_driver(lambda d: d.list_mentions(limit=limit))
@@ -171,3 +258,42 @@ class DiscordService:
             raise
         finally:
             await self._pool.release(driver, broken=broken)
+
+
+def _merge_dedupe(
+    primary: list[Message], extra: list[Message], *, limit: int
+) -> list[Message]:
+    """Merge two message lists, dedupe by id, newest-first, capped at `limit`."""
+    seen: set[str] = set()
+    out: list[Message] = []
+    for m in sorted([*primary, *extra], key=lambda m: m.timestamp, reverse=True):
+        if m.id in seen:
+            continue
+        seen.add(m.id)
+        out.append(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _merge_with_context(
+    focus: list[Message], context: list[Message], *, budget: int
+) -> list[Message]:
+    """Keep every focus message; add up to `budget` surrounding ones.
+
+    Focus (the target author's) messages are never dropped — context only
+    fills in around them — so the result is newest-first and deduped.
+    """
+    seen = {m.id for m in focus}
+    out = list(focus)
+    added = 0
+    for m in sorted(context, key=lambda m: m.timestamp, reverse=True):
+        if m.id in seen:
+            continue
+        seen.add(m.id)
+        out.append(m)
+        added += 1
+        if added >= budget:
+            break
+    out.sort(key=lambda m: m.timestamp, reverse=True)
+    return out

@@ -1,9 +1,19 @@
 """Tests for the non-Playwright logic in mcp_server: chunking + error formatting."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from discord_mcp.errors import InvalidSnowflake, SessionExpired
-from discord_mcp.mcp_server import _chunk_message, _cutoff, _to_error
+from discord_mcp.mcp_server import (
+    DEFAULT_LIMIT,
+    MAX_MESSAGES_HARD_LIMIT,
+    _chunk_message,
+    _cutoff,
+    _effective_limit,
+    _render,
+    _to_error,
+    _validate_shape,
+)
+from discord_mcp.models import Message, snowflake
 
 
 class TestChunkMessage:
@@ -49,6 +59,18 @@ class TestToError:
         assert err["error"] == "DiscordMcpError"
 
 
+class TestEffectiveLimit:
+    def test_explicit_limit_is_honoured(self):
+        assert _effective_limit(50, time_bounded=True) == 50
+        assert _effective_limit(50, time_bounded=False) == 50
+
+    def test_omitted_limit_walks_whole_window_when_time_bounded(self):
+        assert _effective_limit(None, time_bounded=True) == MAX_MESSAGES_HARD_LIMIT
+
+    def test_omitted_limit_defaults_small_when_unbounded(self):
+        assert _effective_limit(None, time_bounded=False) == DEFAULT_LIMIT
+
+
 class TestCutoff:
     def test_none_means_no_lower_bound(self):
         assert _cutoff(None) is None
@@ -59,3 +81,61 @@ class TestCutoff:
         assert cutoff is not None
         assert cutoff.tzinfo is not None
         assert cutoff < before
+
+
+def _m(mid: str, *, minutes: int, channel: str = "100") -> Message:
+    return Message(
+        id=mid,
+        content="hi",
+        author_name="Bob",
+        channel_id=snowflake(channel),
+        timestamp=datetime(2026, 6, 12, 14, 0, tzinfo=timezone.utc)
+        + timedelta(minutes=minutes),
+        attachments=[],
+        author_id="1",
+    )
+
+
+class TestValidateShape:
+    def test_accepts_known_values(self):
+        assert _validate_shape("conversation", ["mentions"]) is None
+        assert _validate_shape("none", None) is None
+
+    def test_rejects_unknown_group_by(self):
+        err = _validate_shape("topic", None)
+        assert err is not None and err["error"] == "validation_error"
+
+    def test_accepts_context_include(self):
+        assert _validate_shape("conversation", ["context", "mentions"]) is None
+
+    def test_rejects_unknown_include(self):
+        err = _validate_shape("conversation", ["bogus"])
+        assert err is not None and "bogus" in err["message"]
+
+
+class TestRender:
+    def test_none_returns_flat_dicts_with_ids(self):
+        out = _render(
+            [_m("1", minutes=0)], group_by="none", show_author=False, include=None
+        )
+        assert out[0]["id"] == "1"
+        assert "timestamp" in out[0]
+
+    def test_conversation_groups_into_channel_bursts(self):
+        out = _render(
+            [_m("1", minutes=0), _m("2", minutes=2)],
+            group_by="conversation",
+            show_author=False,
+            include=None,
+        )
+        assert out[0]["channel_id"] == "100"
+        assert out[0]["bursts"][0]["count"] == 2
+
+    def test_channel_groups_by_channel(self):
+        out = _render(
+            [_m("1", minutes=0, channel="100"), _m("2", minutes=0, channel="200")],
+            group_by="channel",
+            show_author=False,
+            include=None,
+        )
+        assert {c["channel_id"] for c in out} == {"100", "200"}

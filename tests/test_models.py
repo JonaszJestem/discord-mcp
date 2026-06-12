@@ -8,8 +8,11 @@ from discord_mcp.models import (
     Channel,
     Guild,
     Message,
+    ReplyRef,
+    Thread,
     snowflake,
     snowflake_for_time,
+    time_for_snowflake,
 )
 
 
@@ -90,3 +93,62 @@ class TestSnowflakeForTime:
             DISCORD_EPOCH_MS / 1000 + 1, tz=timezone.utc
         )
         assert snowflake_for_time(one_sec) == str(1000 << 22)
+
+
+class TestTimeForSnowflake:
+    def test_inverts_snowflake_for_time(self):
+        t = datetime(2026, 6, 12, 14, 30, 15, tzinfo=timezone.utc)
+        # snowflake_for_time truncates to whole ms; round-trip should match.
+        assert time_for_snowflake(snowflake_for_time(t)) == t
+
+    def test_epoch_snowflake_maps_to_epoch(self):
+        epoch = datetime.fromtimestamp(DISCORD_EPOCH_MS / 1000, tz=timezone.utc)
+        assert time_for_snowflake("0") == epoch
+
+
+class TestReplyAndMentions:
+    def test_message_defaults_have_no_reply_or_mentions(self):
+        m = Message(
+            id="1",
+            content="x",
+            author_name="A",
+            channel_id=snowflake("100"),
+            timestamp=datetime.now(timezone.utc),
+            attachments=[],
+        )
+        assert m.reply_to is None
+        assert m.mention_names == []
+
+    def test_distinct_messages_have_independent_mention_lists(self):
+        a = Message(
+            id="1",
+            content="x",
+            author_name="A",
+            channel_id=snowflake("100"),
+            timestamp=datetime.now(timezone.utc),
+            attachments=[],
+        )
+        b = Message(
+            id="2",
+            content="y",
+            author_name="B",
+            channel_id=snowflake("100"),
+            timestamp=datetime.now(timezone.utc),
+            attachments=[],
+        )
+        a.mention_names.append("Alice")
+        assert b.mention_names == []  # no shared mutable default
+
+    def test_reply_ref_fields(self):
+        r = ReplyRef(
+            message_id="9", author_name="Daniel", author_id="2", content="wait"
+        )
+        assert (r.author_name, r.content) == ("Daniel", "wait")
+
+
+class TestThread:
+    def test_last_activity_defaults_none(self):
+        t = Thread(
+            id=snowflake("1"), name="t", parent_channel_id=snowflake("2")
+        )
+        assert t.last_activity is None

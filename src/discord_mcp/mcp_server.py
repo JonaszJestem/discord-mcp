@@ -15,12 +15,17 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import Config
 from .errors import DiscordMcpError, InvalidSnowflake, SessionExpired
+from .grouping import group_channels, group_conversations
 from .models import Message, snowflake
 from .discord import DiscordService
 
 
 MAX_MESSAGES_HARD_LIMIT = 1000
 MAX_HOURS_BACK = 8760  # one year
+DEFAULT_LIMIT = 25  # used when the caller omits `limit` on an unbounded query
+GROUP_BY_VALUES = ("conversation", "channel", "none")
+# reply context is always attached; these are opt-in extras.
+INCLUDE_VALUES = ("mentions", "context")
 
 
 def create_mcp_server(service: DiscordService, config: Config) -> FastMCP:
@@ -139,20 +144,31 @@ def create_mcp_server(service: DiscordService, config: Config) -> FastMCP:
     async def search_messages(  # pyright: ignore[reportUnusedFunction]
         server_id: str,
         query: str = "",
-        limit: int = 25,
+        limit: int | None = None,
         channel_id: str | None = None,
         author_id: str | None = None,
         hours_back: int | None = None,
+        group_by: str = "conversation",
+        include: list[str] | None = None,
+        deep: bool = False,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """Search messages in a server, optionally filtered.
 
         Filters combine: `query` (text), `channel_id` (one channel),
         `author_id` (a user snowflake), and `hours_back` (only messages newer
         than N hours). `query` may be empty as long as `author_id` is set.
+
+        Omit `limit` to get the whole `hours_back` window (up to a 1000-message
+        hard cap); without `hours_back` an omitted `limit` defaults to 25.
+
+        `group_by` shapes output: "conversation" (default, channel→time bursts),
+        "channel", or "none" (flat). Each message carries who it replied to;
+        pass include=["mentions"] to also list @-mentions. `deep` additionally
+        walks recent threads (only with `author_id`) for posts search misses.
         """
         if not query.strip() and not author_id:
             return _validation_error("provide a query or an author_id")
-        if not 1 <= limit <= MAX_MESSAGES_HARD_LIMIT:
+        if limit is not None and not 1 <= limit <= MAX_MESSAGES_HARD_LIMIT:
             return _validation_error(
                 f"limit must be between 1 and {MAX_MESSAGES_HARD_LIMIT}"
             )
@@ -160,34 +176,55 @@ def create_mcp_server(service: DiscordService, config: Config) -> FastMCP:
             return _validation_error(
                 f"hours_back must be between 1 and {MAX_HOURS_BACK}"
             )
+        shape_error = _validate_shape(group_by, include)
+        if shape_error is not None:
+            return shape_error
         try:
             guild = snowflake(server_id, field="server_id")
             scope = snowflake(channel_id, field="channel_id") if channel_id else None
             author = snowflake(author_id, field="author_id") if author_id else None
             after = _cutoff(hours_back)
             messages = await service.search_messages(
-                guild, query, channel_id=scope, limit=limit, author_id=author, after=after
+                guild,
+                query,
+                channel_id=scope,
+                limit=_effective_limit(limit, time_bounded=hours_back is not None),
+                author_id=author,
+                after=after,
+                deep=deep,
+                context="context" in (include or []),
             )
         except DiscordMcpError as e:
             return _to_error(e)
-        return [_message_dict(m) for m in messages]
+        return _render(messages, group_by=group_by, show_author=True, include=include)
 
     @mcp.tool()
     async def get_user_messages(  # pyright: ignore[reportUnusedFunction]
         server_id: str,
         author: str,
         hours_back: int = 24,
-        limit: int = 25,
+        limit: int | None = None,
         channel_id: str | None = None,
+        group_by: str = "conversation",
+        include: list[str] | None = None,
+        deep: bool = False,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """Messages a person posted in a server within the last `hours_back`.
 
         `author` is a user snowflake (e.g. '125570309171445760') or a username
         we've already seen in this server (resolved from the local cache).
+
+        Returns the whole `hours_back` window by default (up to a 1000-message
+        hard cap); pass `limit` only to cap the count below that.
+
+        `group_by` shapes output: "conversation" (default, channel→time bursts),
+        "channel", or "none" (flat). Each message carries who it replied to;
+        pass include=["mentions"] to also list @-mentions. `deep` additionally
+        walks recent threads for posts the search index misses.
         """
         if not author.strip():
             return _validation_error("author is required")
-        if not 1 <= limit <= MAX_MESSAGES_HARD_LIMIT:
+        if limit is not None and not 1 <= limit <= MAX_MESSAGES_HARD_LIMIT:
             return _validation_error(
                 f"limit must be between 1 and {MAX_MESSAGES_HARD_LIMIT}"
             )
@@ -195,6 +232,9 @@ def create_mcp_server(service: DiscordService, config: Config) -> FastMCP:
             return _validation_error(
                 f"hours_back must be between 1 and {MAX_HOURS_BACK}"
             )
+        shape_error = _validate_shape(group_by, include)
+        if shape_error is not None:
+            return shape_error
         resolved = service.resolve_person(author)
         if resolved is None:
             return {
@@ -212,13 +252,19 @@ def create_mcp_server(service: DiscordService, config: Config) -> FastMCP:
                 guild,
                 "",
                 channel_id=scope,
-                limit=limit,
+                limit=_effective_limit(limit, time_bounded=True),
                 author_id=author_sf,
                 after=_cutoff(hours_back),
+                deep=deep,
+                context="context" in (include or []),
             )
         except DiscordMcpError as e:
             return _to_error(e)
-        return [_message_dict(m) for m in messages]
+        # Context pulls in other people's messages, so label authors.
+        show_author = "context" in (include or [])
+        return _render(
+            messages, group_by=group_by, show_author=show_author, include=include
+        )
 
     @mcp.tool()
     async def resolve_user(  # pyright: ignore[reportUnusedFunction]
@@ -336,14 +382,63 @@ def _validation_error(message: str) -> dict[str, Any]:
     return {"error": "validation_error", "message": message}
 
 
+def _effective_limit(limit: int | None, *, time_bounded: bool) -> int:
+    """Resolve how many messages to walk for.
+
+    When the caller passes `limit`, honour it. When they omit it, a time-bounded
+    query (a `hours_back`/`after` floor is set) walks the *whole window* up to the
+    hard cap, so the time range — not an arbitrary count — is the boundary. An
+    unbounded query keeps a small default so it can't accidentally pull 1000 rows.
+    """
+    if limit is not None:
+        return limit
+    return MAX_MESSAGES_HARD_LIMIT if time_bounded else DEFAULT_LIMIT
+
+
 def _cutoff(hours_back: int | None) -> datetime | None:
     if hours_back is None:
         return None
     return datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
 
-def _message_dict(m: Message) -> dict[str, Any]:
-    return {
+def _validate_shape(
+    group_by: str, include: list[str] | None
+) -> dict[str, Any] | None:
+    """Reject unknown `group_by` / `include` values; None means valid."""
+    if group_by not in GROUP_BY_VALUES:
+        return _validation_error(
+            f"group_by must be one of {list(GROUP_BY_VALUES)}"
+        )
+    unknown = [i for i in (include or []) if i not in INCLUDE_VALUES]
+    if unknown:
+        return _validation_error(
+            f"unknown include {unknown}; supported: {list(INCLUDE_VALUES)}"
+        )
+    return None
+
+
+def _render(
+    messages: list[Message],
+    *,
+    group_by: str,
+    show_author: bool,
+    include: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Shape messages per `group_by`; reply context is always attached."""
+    include_mentions = "mentions" in (include or [])
+    if group_by == "none":
+        return [_message_dict(m, include_mentions=include_mentions) for m in messages]
+    if group_by == "channel":
+        return group_channels(
+            messages, show_author=show_author, include_mentions=include_mentions
+        )
+    return group_conversations(
+        messages, show_author=show_author, include_mentions=include_mentions
+    )
+
+
+def _message_dict(m: Message, *, include_mentions: bool = False) -> dict[str, Any]:
+    out: dict[str, Any] = {
         "id": m.id,
         "content": m.content,
         "author_name": m.author_name,
@@ -352,6 +447,16 @@ def _message_dict(m: Message) -> dict[str, Any]:
         "timestamp": m.timestamp.isoformat(),
         "attachments": m.attachments,
     }
+    if m.reply_to is not None:
+        out["reply_to"] = {
+            "message_id": m.reply_to.message_id,
+            "author_name": m.reply_to.author_name,
+            "author_id": m.reply_to.author_id,
+            "content": m.reply_to.content,
+        }
+    if include_mentions and m.mention_names:
+        out["mentions"] = list(m.mention_names)
+    return out
 
 
 def _chunk_message(content: str, *, limit: int) -> list[str]:

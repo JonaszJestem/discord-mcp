@@ -26,11 +26,13 @@ from ..models import (
     Channel,
     Guild,
     Message,
+    ReplyRef,
     SessionData,
     Snowflake,
     Thread,
     snowflake,
     snowflake_for_time,
+    time_for_snowflake,
 )
 from .api_client import ApiUnavailable, DiscordApiClient
 
@@ -40,6 +42,8 @@ _CHAT_MESSAGES_SELECTOR = '[data-list-id="chat-messages"]'
 _AVATAR_ID_RE = re.compile(r"/avatars/(\d+)/")
 _SEARCH_PAGE_SIZE = 25  # Discord returns 25 search results per page
 _SEARCH_MAX_PAGES = 40  # safety cap → at most 1000 messages per search
+_CHANNEL_API_PAGE_SIZE = 100  # /messages returns up to 100 per call
+_CHANNEL_READ_MAX_PAGES = 5  # safety cap → at most 500 messages per channel read
 _MESSAGE_INPUT_SELECTOR = '[data-slate-editor="true"]'
 
 
@@ -280,6 +284,118 @@ class DiscordBrowserDriver:
                 )
             )
         return results
+
+    async def list_all_threads(self, guild_id: Snowflake) -> list[Thread]:
+        """Every active thread in the guild, each stamped with last-activity.
+
+        Unlike `list_threads`, this keeps threads from all parent channels — the
+        deep fan-out walks them to catch activity the search index misses.
+        """
+        await self._ensure_discord_origin()
+        try:
+            payload = await self._api.fetch_json(
+                f"/api/v9/guilds/{guild_id}/threads/active"
+            )
+        except ApiUnavailable as e:
+            logger.debug(f"Active threads API failed: {e}")
+            return []
+        if not isinstance(payload, dict):
+            return []
+        raw_threads_any = cast(dict[str, Any], payload).get("threads")
+        if not isinstance(raw_threads_any, list):
+            return []
+
+        results: list[Thread] = []
+        for t in cast(list[Any], raw_threads_any):
+            if not isinstance(t, dict):
+                continue
+            td = cast(dict[str, Any], t)
+            raw_id = td.get("id")
+            if not isinstance(raw_id, str) or not raw_id.isdigit():
+                continue
+            try:
+                tid = snowflake(raw_id, field="thread_id")
+            except Exception:
+                continue
+            parent_raw = td.get("parent_id")
+            parent = (
+                snowflake(parent_raw, field="channel_id")
+                if isinstance(parent_raw, str) and parent_raw.isdigit()
+                else tid
+            )
+            name = td.get("name")
+            results.append(
+                Thread(
+                    id=tid,
+                    name=name if isinstance(name, str) else f"thread-{tid}",
+                    parent_channel_id=parent,
+                    last_activity=_thread_last_activity(td),
+                )
+            )
+        return results
+
+    async def read_channel_messages_api(
+        self,
+        channel_id: Snowflake,
+        *,
+        after: datetime | None,
+        limit: int,
+        before: datetime | None = None,
+    ) -> list[Message]:
+        """Read a channel/thread's messages via the messages API.
+
+        Far faster than the DOM read path and the payload carries
+        `referenced_message`/`mentions`, so replies and pings survive. Walks
+        backwards from `before` (newest if unset) with `before`-pagination until
+        it crosses the `after` floor or runs dry — i.e. the `(after, before]`
+        window.
+        """
+        await self._ensure_discord_origin()
+        collected: list[Message] = []
+        seen: set[str] = set()
+        cursor: str | None = (
+            snowflake_for_time(before) if before is not None else None
+        )
+        for _ in range(_CHANNEL_READ_MAX_PAGES):
+            if len(collected) >= limit:
+                break
+            params = [f"limit={_CHANNEL_API_PAGE_SIZE}"]
+            if cursor is not None:
+                params.append(f"before={cursor}")
+            path = f"/api/v9/channels/{channel_id}/messages?" + "&".join(params)
+            try:
+                payload = await self._api.fetch_json(path)
+            except ApiUnavailable as e:
+                logger.debug(f"Channel read API failed at before={cursor}: {e}")
+                break
+            if not isinstance(payload, list):
+                break
+            items = cast(list[Any], payload)
+            if not items:
+                break
+
+            reached_floor = False
+            for raw in items:
+                msg = _message_from_api(raw, channel_id)
+                if after is not None and msg.timestamp <= after:
+                    reached_floor = True
+                    break
+                if msg.id in seen:
+                    continue
+                seen.add(msg.id)
+                collected.append(msg)
+                if len(collected) >= limit:
+                    break
+
+            last = items[-1]
+            cursor = (
+                cast(dict[str, Any], last).get("id") if isinstance(last, dict) else None
+            )
+            if not isinstance(cursor, str):
+                cursor = None
+            if reached_floor or cursor is None or len(items) < _CHANNEL_API_PAGE_SIZE:
+                break
+        return collected
 
     async def search_messages(
         self,
@@ -663,17 +779,7 @@ def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
                 if isinstance(url, str):
                     attachments.append(url)
 
-    author_name = "Unknown"
-    author_id: str | None = None
-    raw_author = data.get("author")
-    if isinstance(raw_author, dict):
-        author = cast(dict[str, Any], raw_author)
-        name = author.get("global_name") or author.get("username")
-        if isinstance(name, str):
-            author_name = name
-        aid = author.get("id")
-        if isinstance(aid, str) and aid.isdigit():
-            author_id = aid
+    author_name, author_id = _author_name_id(data.get("author"))
 
     raw_id = data.get("id")
     raw_content = data.get("content")
@@ -686,7 +792,69 @@ def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
         timestamp=ts,
         attachments=attachments,
         author_id=author_id,
+        reply_to=_reply_ref_from_api(data.get("referenced_message")),
+        mention_names=_mention_names_from_api(data.get("mentions")),
     )
+
+
+def _author_name_id(raw_author: Any) -> tuple[str, str | None]:
+    """Extract (display name, numeric id) from a Discord author object."""
+    if not isinstance(raw_author, dict):
+        return "Unknown", None
+    author = cast(dict[str, Any], raw_author)
+    name = author.get("global_name") or author.get("username")
+    author_name = name if isinstance(name, str) else "Unknown"
+    aid = author.get("id")
+    author_id = aid if isinstance(aid, str) and aid.isdigit() else None
+    return author_name, author_id
+
+
+def _reply_ref_from_api(raw: Any) -> ReplyRef | None:
+    """Build a ReplyRef from a `referenced_message` payload, if present."""
+    if not isinstance(raw, dict):
+        return None
+    data = cast(dict[str, Any], raw)
+    author_name, author_id = _author_name_id(data.get("author"))
+    raw_id = data.get("id")
+    content = data.get("content")
+    return ReplyRef(
+        message_id=str(raw_id) if isinstance(raw_id, str) else "unknown",
+        author_name=author_name,
+        author_id=author_id,
+        content=content if isinstance(content, str) else "",
+    )
+
+
+def _mention_names_from_api(raw: Any) -> list[str]:
+    """Display names of users @-mentioned in the message."""
+    if not isinstance(raw, list):
+        return []
+    names: list[str] = []
+    for u in cast(list[Any], raw):
+        name, _ = _author_name_id(u)
+        if name != "Unknown":
+            names.append(name)
+    return names
+
+
+def _thread_last_activity(td: dict[str, Any]) -> datetime | None:
+    """Best-effort last-activity instant of a thread.
+
+    Prefers `last_message_id` (its snowflake encodes the time); falls back to
+    the archive timestamp in `thread_metadata`.
+    """
+    last_id = td.get("last_message_id")
+    if isinstance(last_id, str) and last_id.isdigit():
+        return time_for_snowflake(last_id)
+    meta = td.get("thread_metadata")
+    if isinstance(meta, dict):
+        ats = cast(dict[str, Any], meta).get("archive_timestamp")
+        if isinstance(ats, str):
+            try:
+                return datetime.fromisoformat(ats.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+    return None
 
 
 def _split_message_id(

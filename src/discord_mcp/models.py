@@ -8,8 +8,8 @@ typed as Snowflake is a numeric Discord ID.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, NewType
 
 from .errors import InvalidSnowflake
@@ -47,6 +47,15 @@ def snowflake_for_time(dt: datetime) -> Snowflake:
     return Snowflake(str(max(ms, 0) << 22))
 
 
+def time_for_snowflake(sf: str) -> datetime:
+    """The UTC instant a snowflake was minted — inverse of `snowflake_for_time`.
+
+    Lets us derive a thread/message's age from its ID without a separate fetch.
+    """
+    ms = (int(sf) >> 22) + DISCORD_EPOCH_MS
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
 @dataclass(frozen=True, slots=True)
 class Guild:
     id: Snowflake
@@ -62,6 +71,20 @@ class Channel:
 
 
 @dataclass(frozen=True, slots=True)
+class ReplyRef:
+    """The message a reply points at (Discord's `referenced_message`).
+
+    Lets a consumer see *who* someone was responding to and what they said,
+    without a second fetch.
+    """
+
+    message_id: str
+    author_name: str
+    author_id: str | None
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
 class Message:
     id: str
     content: str
@@ -72,6 +95,9 @@ class Message:
     # Only API-sourced messages (search, mentions) reliably carry the author's
     # snowflake; DOM-scraped reads fill it best-effort from the avatar URL.
     author_id: str | None = None
+    # Conversation context, populated from the API payload when present.
+    reply_to: ReplyRef | None = None
+    mention_names: list[str] = field(default_factory=list[str])
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,3 +105,6 @@ class Thread:
     id: Snowflake
     name: str
     parent_channel_id: Snowflake
+    # Last-activity instant, derived from `last_message_id` — used to skip
+    # dormant threads during deep fan-out.
+    last_activity: datetime | None = None
