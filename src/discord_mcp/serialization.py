@@ -1,12 +1,13 @@
 """Model → JSON-ready dicts. Pure functions, no I/O.
 
 Only the fetch CLI consumes these; the MCP server has its own rendering.
-Timestamps are ISO-8601 UTC so a shell consumer can compare them as strings.
+Timestamps carry an explicit offset so a shell consumer can compare them as
+strings and a Python one can subtract them from an aware `now`.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .models import Channel, Guild, Message, Thread
@@ -16,7 +17,9 @@ JsonDict = dict[str, Any]
 
 
 def _iso(dt: datetime) -> str:
-    return dt.astimezone().isoformat() if dt.tzinfo is None else dt.isoformat()
+    """Naive input is read as UTC, not as local time: a consumer subtracting
+    this from `now(utc)` would otherwise mis-age the message by the offset."""
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
 
 
 def guild_to_dict(guild: Guild) -> JsonDict:

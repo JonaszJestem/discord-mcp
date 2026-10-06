@@ -186,3 +186,9 @@ def test_message_serialisation_keeps_reply_context() -> None:
 
 def test_message_serialisation_without_reply() -> None:
     assert message_to_dict(_message())["reply_to"] is None
+
+
+def test_naive_timestamps_are_read_as_utc() -> None:
+    """A local-offset guess here mis-ages every message for the poller."""
+    naive = _message(timestamp=datetime(2026, 10, 5, 9, 33))
+    assert message_to_dict(naive)["timestamp"] == "2026-10-05T09:33:00+00:00"
