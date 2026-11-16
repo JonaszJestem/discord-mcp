@@ -43,7 +43,7 @@ _AVATAR_ID_RE = re.compile(r"/avatars/(\d+)/")
 _SEARCH_PAGE_SIZE = 25  # Discord returns 25 search results per page
 _SEARCH_MAX_PAGES = 40  # safety cap → at most 1000 messages per search
 _CHANNEL_API_PAGE_SIZE = 100  # /messages returns up to 100 per call
-_CHANNEL_READ_MAX_PAGES = 5  # safety cap → at most 500 messages per channel read
+_CHANNEL_READ_MAX_PAGES = 30  # safety cap → at most 3000 messages per channel read
 _MESSAGE_INPUT_SELECTOR = '[data-slate-editor="true"]'
 
 
@@ -429,7 +429,33 @@ class DiscordBrowserDriver:
             if channel_id is not None
             else snowflake("0" * 17, field="channel_id")
         )
+        results = await self._search_pages(
+            f"/api/v9/guilds/{guild_id}/messages/search",
+            base_params,
+            placeholder=placeholder,
+            limit=limit,
+            after=after,
+        )
+        if not results and channel_id is not None:
+            # Group DMs live outside the guild index; only the channel endpoint sees them.
+            results = await self._search_pages(
+                f"/api/v9/channels/{channel_id}/messages/search",
+                [p for p in base_params if not p.startswith("channel_id=")],
+                placeholder=placeholder,
+                limit=limit,
+                after=after,
+            )
+        return results
 
+    async def _search_pages(
+        self,
+        search_path: str,
+        base_params: list[str],
+        *,
+        placeholder: Snowflake,
+        limit: int,
+        after: datetime | None,
+    ) -> list[Message]:
         # Discord's search returns one page (25 results) per call. Walk pages by
         # `offset` until we hit `limit`, run past the `after` floor (results are
         # timestamp-desc, so once one is too old the rest are too), or run dry.
@@ -440,7 +466,7 @@ class DiscordBrowserDriver:
             if len(results) >= limit:
                 break
             params = base_params + ([f"offset={offset}"] if offset else [])
-            path = f"/api/v9/guilds/{guild_id}/messages/search?" + "&".join(params)
+            path = f"{search_path}?" + "&".join(params)
             try:
                 payload = await self._api.fetch_json(path)
             except ApiUnavailable as e:
