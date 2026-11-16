@@ -89,9 +89,7 @@ class TestSnowflakeForTime:
 
     def test_timestamp_bits_match_discord_layout(self):
         # one second after the epoch → 1000 ms → 1000 << 22
-        one_sec = datetime.fromtimestamp(
-            DISCORD_EPOCH_MS / 1000 + 1, tz=timezone.utc
-        )
+        one_sec = datetime.fromtimestamp(DISCORD_EPOCH_MS / 1000 + 1, tz=timezone.utc)
         assert snowflake_for_time(one_sec) == str(1000 << 22)
 
 
@@ -148,7 +146,5 @@ class TestReplyAndMentions:
 
 class TestThread:
     def test_last_activity_defaults_none(self):
-        t = Thread(
-            id=snowflake("1"), name="t", parent_channel_id=snowflake("2")
-        )
+        t = Thread(id=snowflake("1"), name="t", parent_channel_id=snowflake("2"))
         assert t.last_activity is None

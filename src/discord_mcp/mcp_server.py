@@ -401,14 +401,10 @@ def _cutoff(hours_back: int | None) -> datetime | None:
     return datetime.now(timezone.utc) - timedelta(hours=hours_back)
 
 
-def _validate_shape(
-    group_by: str, include: list[str] | None
-) -> dict[str, Any] | None:
+def _validate_shape(group_by: str, include: list[str] | None) -> dict[str, Any] | None:
     """Reject unknown `group_by` / `include` values; None means valid."""
     if group_by not in GROUP_BY_VALUES:
-        return _validation_error(
-            f"group_by must be one of {list(GROUP_BY_VALUES)}"
-        )
+        return _validation_error(f"group_by must be one of {list(GROUP_BY_VALUES)}")
     unknown = [i for i in (include or []) if i not in INCLUDE_VALUES]
     if unknown:
         return _validation_error(

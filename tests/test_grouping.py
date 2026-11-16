@@ -50,7 +50,10 @@ class TestMessageView:
 
     def test_reply_context_attached(self):
         reply = ReplyRef(
-            message_id="9", author_name="Daniel", author_id="2", content="wait dont merge"
+            message_id="9",
+            author_name="Daniel",
+            author_id="2",
+            content="wait dont merge",
         )
         v = message_view(
             _msg("1", minutes=0, reply_to=reply),

@@ -55,7 +55,11 @@ class TestRecord:
         cache = DiscoveryCache(tmp_path / "c.json")
         cache.record_guilds([Guild(id=snowflake("1"), name="Server")])
         cache.record_channels(
-            [Channel(id=snowflake("2"), name="general", type=0, guild_id=snowflake("1"))]
+            [
+                Channel(
+                    id=snowflake("2"), name="general", type=0, guild_id=snowflake("1")
+                )
+            ]
         )
         reloaded = DiscoveryCache(tmp_path / "c.json")
         assert reloaded.resolve_person("123") == "123"  # cache usable after reload
