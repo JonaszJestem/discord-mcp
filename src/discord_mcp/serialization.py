@@ -1,6 +1,7 @@
 """Model → JSON-ready dicts. Pure functions, no I/O.
 
-Only the fetch CLI consumes these; the MCP server has its own rendering.
+The fetch CLI and the event stream consume these; the MCP server's read tools
+have their own rendering.
 Timestamps carry an explicit offset so a shell consumer can compare them as
 strings and a Python one can subtract them from an aware `now`.
 """
@@ -10,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from .models import Channel, Guild, Message, Thread
+from .models import Channel, Guild, Message, MessageEvent, Thread
 
 
 JsonDict = dict[str, Any]
@@ -65,4 +66,12 @@ def message_to_dict(message: Message) -> JsonDict:
             if reply
             else None
         ),
+    }
+
+
+def event_to_dict(event: MessageEvent) -> JsonDict:
+    return {
+        "kinds": sorted(event.kinds),
+        "guild_id": event.guild_id,
+        "message": message_to_dict(event.message),
     }

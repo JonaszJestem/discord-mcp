@@ -20,6 +20,8 @@ An [MCP server](https://modelcontextprotocol.io) that lets Claude and other LLM 
 | `read_thread` | Reads messages inside a specific thread |
 | `search_messages` | Searches messages in a server (optionally scoped to one channel) |
 | `get_mentions` | Lists recent @mentions of you across all servers |
+| `get_events` | Returns new messages (mentions, DMs, or all) seen since a cursor, without waiting |
+| `wait_for_events` | Blocks until a matching new message arrives (timeout up to a day), then returns it with a cursor |
 
 **Write-side (only when `DISCORD_READ_ONLY=false`):**
 
@@ -165,6 +167,7 @@ Once connected, try any of these in Claude:
 - *"Any new @mentions I should know about?"*
 - *"Search for 'deploy' in the #devops channel last month."*
 - *"What active threads are in #engineering?"*
+- *"Watch Discord and tell me when someone mentions me."*
 
 If you have `DISCORD_READ_ONLY=false`:
 
@@ -181,7 +184,30 @@ discord-mcp login    # Interactive browser login, save session
 discord-mcp status   # Show whether a session is stored
 discord-mcp logout   # Delete the encrypted session and keyring key
 discord-mcp serve    # Run the MCP stdio server (MCP clients call this)
+discord-mcp watch    # Print one JSON line per new mention/DM until Ctrl-C
 ```
+
+---
+
+## Listening for new messages
+
+The first `get_events` / `wait_for_events` call (or `discord-mcp watch`) starts a
+background browser that keeps Discord's own gateway connection open and records
+each incoming message. Nothing extra is sent to Discord: it reads the events the
+web client already receives. Messages that arrived before the listener started
+are not included; use `get_mentions` / `read_messages` for history.
+
+- **Kinds:** `mention` (you are @-mentioned directly, reply pings included; not
+  `@everyone`/roles), `dm` (direct or group DM), `message` (every incoming
+  message). Default: `mention` + `dm`. Your own messages are skipped.
+- **Cursor:** each response carries `cursor`; pass it back as `since` and no
+  event between calls is lost. `missed > 0` means the 10,000-event buffer
+  overflowed; `reset: true` means the server restarted since the cursor was issued.
+- **Long waits:** `wait_for_events` takes `timeout_s` up to 86,400 and sends an
+  MCP progress notification every 30 s while waiting. Your client's own tool
+  timeout still applies; in Claude Code raise it with `MCP_TOOL_TIMEOUT` (ms).
+- **Scripts:** `discord-mcp watch [--kinds mention,dm,message] [--channel ID]`
+  prints events as JSON lines, e.g. `discord-mcp watch | while read -r e; do …; done`.
 
 ---
 
@@ -217,10 +243,11 @@ All configuration is via environment variables (set in your MCP client config or
 
 ## Legal / terms of service
 
-This tool automates a **regular user account** in two ways:
+This tool automates a **regular user account** in three ways:
 
 1. **DOM scraping via Playwright** — for listing guilds, channels, and reading channel messages.
 2. **Discord's internal JSON API** (`/api/v9/...`) — for pins, threads, search, and mentions. The tool extracts your session token from the browser and sends authenticated requests to the same endpoints Discord's web client uses.
+3. **Reading the web client's gateway traffic** — for `get_events` / `wait_for_events` / `watch`. A browser stays logged in for as long as the listener runs.
 
 Both patterns are against [Discord's Terms of Service](https://discord.com/terms) (they prohibit "self-bots"). Calling the internal API directly is the more deliberate violation of the two and carries higher detection risk than scraping.
 

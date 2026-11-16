@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
+import zlib
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, cast
 
@@ -17,15 +21,17 @@ from playwright.async_api import (
     ElementHandle,
     Page,
     Playwright,
+    WebSocket,
     async_playwright,
 )
 
-from ..errors import SessionExpired
+from ..errors import GatewayStalled, SessionExpired
 from ..logger import logger
 from ..models import (
     Channel,
     Guild,
     Message,
+    MessageEvent,
     ReplyRef,
     SessionData,
     Snowflake,
@@ -35,6 +41,7 @@ from ..models import (
     time_for_snowflake,
 )
 from .api_client import ApiUnavailable, DiscordApiClient
+from .gateway import GATEWAY_HOST, OP_DISPATCH, ZlibStreamDecoder, classify
 
 
 _LOGGED_IN_SELECTOR = '[data-list-id="guildsnav"] [role="treeitem"]'
@@ -45,6 +52,7 @@ _SEARCH_MAX_PAGES = 40  # safety cap → at most 1000 messages per search
 _CHANNEL_API_PAGE_SIZE = 100  # /messages returns up to 100 per call
 _CHANNEL_READ_MAX_PAGES = 30  # safety cap → at most 3000 messages per channel read
 _MESSAGE_INPUT_SELECTOR = '[data-slate-editor="true"]'
+_GATEWAY_CHECK_S = 5.0
 
 
 class DiscordBrowserDriver:
@@ -594,6 +602,64 @@ class DiscordBrowserDriver:
         await first.click()
         await asyncio.sleep(1)
 
+    async def stream_gateway(
+        self, on_event: Callable[[MessageEvent], None], *, silence_s: float
+    ) -> None:
+        """Feed each incoming message to `on_event`; only returns by raising.
+
+        Reloads the page so the fresh socket's READY (the self id) is observed.
+        Raises GatewayStalled when the page dies or the socket stays silent past
+        `silence_s` (the client's heartbeat ACKs arrive about every 41s).
+        """
+        state = _GatewayState(last_frame=time.monotonic())
+
+        def on_socket(ws: WebSocket) -> None:
+            if GATEWAY_HOST not in ws.url:
+                return
+            decoder = ZlibStreamDecoder()
+
+            def on_frame(frame: str | bytes) -> None:
+                state.last_frame = time.monotonic()
+                if isinstance(frame, str):
+                    return
+                try:
+                    payload = decoder.feed(frame)
+                    if payload is not None:
+                        _handle_payload(payload, state, on_event)
+                except (zlib.error, ValueError) as e:
+                    state.failure = f"undecodable gateway frame: {e}"
+                except Exception as e:
+                    logger.warning(f"Gateway event handler failed: {e}")
+
+            ws.on("framereceived", on_frame)
+
+        def on_crash(_: Page) -> None:
+            state.failure = "page crashed"
+
+        page = self._page
+        page.on("websocket", on_socket)
+        page.on("crash", on_crash)
+        try:
+            await page.goto(
+                "https://discord.com/channels/@me", wait_until="domcontentloaded"
+            )
+            while True:
+                await asyncio.sleep(_GATEWAY_CHECK_S)
+                if page.is_closed():
+                    raise GatewayStalled("page closed")
+                if "/login" in page.url:
+                    raise SessionExpired(
+                        "Discord logged the session out. "
+                        "Run `discord-mcp login` to re-authenticate."
+                    )
+                if state.failure:
+                    raise GatewayStalled(state.failure)
+                if time.monotonic() - state.last_frame > silence_s:
+                    raise GatewayStalled(f"no gateway traffic for {silence_s:.0f}s")
+        finally:
+            page.remove_listener("websocket", on_socket)
+            page.remove_listener("crash", on_crash)
+
     # --------------------------------------------------------------- internal
 
     async def _ensure_discord_origin(self) -> None:
@@ -761,6 +827,40 @@ def _search_hit(group_any: Any) -> dict[str, Any] | None:
     if group and isinstance(group[0], dict):
         return cast(dict[str, Any], group[0])
     return None
+
+
+@dataclass(slots=True)
+class _GatewayState:
+    last_frame: float
+    self_id: str | None = None
+    failure: str | None = None
+
+
+def _handle_payload(
+    payload: dict[str, Any],
+    state: _GatewayState,
+    on_event: Callable[[MessageEvent], None],
+) -> None:
+    data = payload.get("d")
+    if payload.get("op") != OP_DISPATCH or not isinstance(data, dict):
+        return
+    d = cast(dict[str, Any], data)
+    if payload.get("t") == "READY":
+        _, state.self_id = _author_name_id(d.get("user"))
+        return
+    if payload.get("t") != "MESSAGE_CREATE":
+        return
+    kinds = classify(d, state.self_id)
+    if kinds is None:
+        return
+    guild_raw = d.get("guild_id")
+    guild_id = (
+        snowflake(guild_raw, field="guild_id")
+        if isinstance(guild_raw, str) and guild_raw.isdigit()
+        else None
+    )
+    placeholder = snowflake("0" * 17, field="channel_id")
+    on_event(MessageEvent(kinds, guild_id, _message_from_api(d, placeholder)))
 
 
 def _message_from_api(raw: Any, fallback_channel_id: Snowflake) -> Message:
