@@ -6,6 +6,7 @@ Subcommands:
     discord-mcp logout  — clear the stored session
     discord-mcp status  — show whether a session is stored
     discord-mcp fetch   — one-shot read, JSON on stdout (for scripts/pollers)
+    discord-mcp watch   — stream new messages as JSON lines until interrupted
 
 All wiring of concrete implementations lives here.
 """
@@ -22,16 +23,22 @@ from .auth import AuthService, EncryptedFileSessionStore, OSKeyringVault, Sessio
 from .cache import DiscoveryCache
 from .config import Config
 from .discord import BrowserPool, DiscordBrowserDriver, DiscordService
-from .errors import DiscordMcpError
+from .discord.listener import GatewayListener
+from .errors import DiscordMcpError, SessionExpired
+from .events import EventBuffer, EventQuery, parse_kinds
 from .mcp_server import create_mcp_server
-from .models import snowflake
+from .models import SessionData, snowflake
 from .serialization import (
     JsonDict,
     channel_to_dict,
+    event_to_dict,
     guild_to_dict,
     message_to_dict,
     thread_to_dict,
 )
+
+_WATCH_WAIT_S = 3_600
+_WATCH_BATCH = 500
 
 
 def main() -> int:
@@ -52,6 +59,7 @@ def _dispatch(args: list[str]) -> int:
         "logout": _cmd_logout,
         "status": _cmd_status,
         "fetch": _cmd_fetch,
+        "watch": _cmd_watch,
     }
     if not args:
         return _usage()
@@ -63,7 +71,8 @@ def _dispatch(args: list[str]) -> int:
 
 def _usage() -> int:
     print(
-        "usage: discord-mcp {serve | login | logout | status | fetch}", file=sys.stderr
+        "usage: discord-mcp {serve | login | logout | status | fetch | watch}",
+        file=sys.stderr,
     )
     return 2
 
@@ -81,8 +90,76 @@ def _cmd_serve(_: list[str]) -> int:
 
     pool = BrowserPool(factory=driver_factory, max_size=config.pool_size)
     service = DiscordService(pool, DiscoveryCache(config.cache_path))
-    create_mcp_server(service, config).run()
+    listener = _build_listener(session, config)
+    create_mcp_server(service, config, listener).run()
     return 0
+
+
+def _cmd_watch(argv: list[str]) -> int:
+    ns = _watch_parser().parse_args(argv)
+    try:
+        kinds = parse_kinds(ns.kinds.split(",") if ns.kinds else None)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    query = EventQuery(
+        kinds, frozenset(snowflake(c, field="--channel") for c in ns.channel)
+    )
+    config = Config.load()
+    listener = _build_listener(_build_session_store(config).load(), config)
+
+    async def run() -> None:
+        listener.start()
+        cursor: str | None = None
+        try:
+            while True:
+                batch = await listener.buffer.wait(
+                    cursor,
+                    query=query,
+                    limit=_WATCH_BATCH,
+                    timeout_s=_WATCH_WAIT_S,
+                    should_stop=lambda: listener.status().session_expired,
+                )
+                cursor = batch.cursor
+                if batch.gap:
+                    print("warning: events were dropped (buffer full)", file=sys.stderr)
+                for item in batch.events:
+                    print(json.dumps(event_to_dict(item.event)), flush=True)
+                if not batch.events and listener.status().session_expired:
+                    raise SessionExpired(listener.status().last_error or "")
+        finally:
+            await listener.close()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _watch_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="discord-mcp watch",
+        description="Print one JSON line per new Discord message until interrupted.",
+    )
+    parser.add_argument(
+        "--kinds",
+        help="comma-separated subset of mention,dm,message (default: mention,dm)",
+    )
+    parser.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        help="only this channel id (repeatable)",
+    )
+    return parser
+
+
+def _build_listener(session: SessionData, config: Config) -> GatewayListener:
+    async def driver_factory() -> DiscordBrowserDriver:
+        return await DiscordBrowserDriver.create(session, headless=config.headless)
+
+    return GatewayListener(driver_factory, EventBuffer())
 
 
 def _cmd_login(_: list[str]) -> int:

@@ -41,6 +41,7 @@ discord-mcp serve    # MCP stdio server — what MCP clients invoke
 discord-mcp login    # Headful browser; user signs in; session encrypted + saved
 discord-mcp logout   # Clear session file + keyring key
 discord-mcp status   # Report whether a session is stored
+discord-mcp watch    # Stream new mentions/DMs as JSON lines
 ```
 
 ## Tooling

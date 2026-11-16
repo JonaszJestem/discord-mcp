@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, NewType
+from typing import Any, Literal, NewType
 
 from .errors import InvalidSnowflake
 
@@ -108,3 +108,15 @@ class Thread:
     # Last-activity instant, derived from `last_message_id` — used to skip
     # dormant threads during deep fan-out.
     last_activity: datetime | None = None
+
+
+EventKind = Literal["mention", "dm", "message"]
+
+
+@dataclass(frozen=True, slots=True)
+class MessageEvent:
+    """A message that arrived over the gateway. `kinds` always holds "message"."""
+
+    kinds: frozenset[EventKind]
+    guild_id: Snowflake | None
+    message: Message

@@ -139,3 +139,81 @@ class TestRender:
             include=None,
         )
         assert {c["channel_id"] for c in out} == {"100", "200"}
+
+
+class TestEventTools:
+    def _server(self):
+        import asyncio as _asyncio
+        from unittest.mock import MagicMock
+
+        from discord_mcp.config import Config
+        from discord_mcp.discord.listener import GatewayListener
+        from discord_mcp.events import EventBuffer
+        from discord_mcp.mcp_server import create_mcp_server
+
+        async def factory():
+            await _asyncio.Event().wait()
+
+        listener = GatewayListener(factory, EventBuffer(epoch="e"))  # type: ignore[arg-type]
+        return create_mcp_server(MagicMock(), Config.load(), listener), listener
+
+    async def _call(self, server, name: str, **args):
+        import json
+
+        result = await server.call_tool(name, args)
+        return json.loads(result[0].text)
+
+    async def test_get_events_returns_mentions_and_cursor(self):
+        from discord_mcp.models import MessageEvent
+
+        server, listener = self._server()
+        msg = Message(
+            id="1",
+            content="ping",
+            author_name="a",
+            channel_id=snowflake("42"),
+            timestamp=datetime(2026, 11, 16, tzinfo=timezone.utc),
+            attachments=[],
+        )
+        listener.buffer.publish(
+            MessageEvent(frozenset({"message", "mention"}), snowflake("7"), msg)
+        )
+        out = await self._call(server, "get_events")
+        assert [e["message"]["id"] for e in out["events"]] == ["1"]
+        assert out["events"][0]["kinds"] == ["mention", "message"]
+        assert out["cursor"] == "e:1"
+        await listener.close()
+
+    async def test_validation_errors(self):
+        server, listener = self._server()
+        bad_kind = await self._call(server, "get_events", kinds=["nope"])
+        bad_cursor = await self._call(server, "get_events", since="zzz")
+        bad_timeout = await self._call(server, "wait_for_events", timeout_s=86_401)
+        assert bad_kind["error"] == "validation_error"
+        assert bad_cursor["error"] == "InvalidCursor"
+        assert bad_timeout["error"] == "validation_error"
+        await listener.close()
+
+    async def test_wait_for_events_times_out_with_cursor(self):
+        server, listener = self._server()
+        out = await self._call(server, "wait_for_events", timeout_s=1)
+        assert out["events"] == [] and out["timed_out"] is True
+        assert out["cursor"] == "e:0"
+        await listener.close()
+
+    async def test_lifespan_closes_listener_then_service(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from discord_mcp.config import Config
+        from discord_mcp.mcp_server import create_mcp_server
+
+        order: list[str] = []
+        listener = MagicMock()
+        listener.close = AsyncMock(side_effect=lambda: order.append("listener"))
+        service = MagicMock()
+        service.close = AsyncMock(side_effect=lambda: order.append("service"))
+        server = create_mcp_server(service, Config.load(), listener)
+        lowlevel = server._mcp_server
+        async with lowlevel.lifespan(lowlevel):
+            pass
+        assert order == ["listener", "service"]

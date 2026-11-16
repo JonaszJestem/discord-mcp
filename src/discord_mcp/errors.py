@@ -36,3 +36,11 @@ class SessionExpired(SessionError):
 
 class KeyringUnavailable(SessionError):
     """The OS keyring backend can't be reached on this system."""
+
+
+class InvalidCursor(DiscordMcpError, ValueError):
+    """An event cursor that this server never issued."""
+
+
+class GatewayStalled(DiscordMcpError):
+    """The browser's gateway connection went silent or its page died."""
