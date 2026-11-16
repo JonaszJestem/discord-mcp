@@ -319,7 +319,8 @@ def create_mcp_server(
 
         The first events call starts a background gateway listener; only
         messages arriving after that are seen. `kinds` ⊆ mention, dm, message
-        (default mention+dm; "message" is every incoming message). Pass the
+        (default mention+dm; "message" is every message Discord pushes, which
+        covers DMs fully but only some server channels). Pass the
         returned `cursor` as `since` next time; `gap` means events after it
         were evicted unread.
         """

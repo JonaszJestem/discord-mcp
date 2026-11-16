@@ -200,6 +200,10 @@ are not included; use `get_mentions` / `read_messages` for history.
 - **Kinds:** `mention` (you are @-mentioned directly, reply pings included; not
   `@everyone`/roles), `dm` (direct or group DM), `message` (every incoming
   message). Default: `mention` + `dm`. Your own messages are skipped.
+  Mentions and DMs always arrive. For `message` in server channels, Discord
+  only pushes channels the web client is subscribed to: in a one-hour check it
+  delivered 14 of 22 server messages. Use `read_messages` when you need every
+  message in a channel.
 - **Cursor:** each response carries `cursor`; pass it back as `since` and no
   event between calls is lost. Mentions/DMs and other messages are buffered
   separately (10,000 each), so busy channels cannot push out a mention.
