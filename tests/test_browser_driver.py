@@ -2,6 +2,8 @@
 
 from datetime import datetime, timezone
 
+import pytest
+
 from discord_mcp.discord.browser_driver import (
     _author_name_id,
     _mention_names_from_api,
@@ -148,3 +150,59 @@ class TestThreadLastActivity:
 
     def test_none_when_nothing_present(self):
         assert _thread_last_activity({}) is None
+
+
+class _FakeApi:
+    def __init__(self, responses: dict[str, object]):
+        self.responses = responses
+        self.paths: list[str] = []
+
+    async def fetch_json(self, path: str) -> object:
+        self.paths.append(path)
+        return next((v for k, v in self.responses.items() if path.startswith(k)), None)
+
+
+def _driver_with(api: _FakeApi):
+    from discord_mcp.discord.browser_driver import DiscordBrowserDriver
+
+    driver = DiscordBrowserDriver.__new__(DiscordBrowserDriver)
+    driver._api = api  # type: ignore[assignment]
+
+    async def _noop() -> None:
+        return None
+
+    driver._ensure_discord_origin = _noop  # type: ignore[method-assign]
+    return driver
+
+
+_HIT = {
+    "id": "1500000000000000000",
+    "content": "hi",
+    "timestamp": "2026-10-28T10:00:00+00:00",
+    "author": {"id": "7", "username": "a"},
+    "attachments": [],
+}
+
+
+class TestSearchGroupDmFallback:
+    @pytest.mark.asyncio
+    async def test_falls_back_to_channel_search_when_guild_index_is_empty(self):
+        api = _FakeApi(
+            {
+                "/api/v9/guilds/1/messages/search": {"messages": []},
+                "/api/v9/channels/42/messages/search": {"messages": [[_HIT]]},
+            }
+        )
+        out = await _driver_with(api).search_messages(
+            snowflake("1"), "hi", channel_id=snowflake("42"), limit=10
+        )
+        assert [m.id for m in out] == [_HIT["id"]]
+        assert "channel_id=" not in api.paths[-1]
+
+    @pytest.mark.asyncio
+    async def test_guild_wide_search_never_hits_channel_endpoint(self):
+        api = _FakeApi({"/api/v9/guilds/1/messages/search": {"messages": []}})
+        await _driver_with(api).search_messages(
+            snowflake("1"), "hi", channel_id=None, limit=10
+        )
+        assert all("/channels/" not in p for p in api.paths)

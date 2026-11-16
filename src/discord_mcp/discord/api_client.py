@@ -12,13 +12,20 @@ pins, threads, mentions) and accept the higher ban risk documented in README.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from playwright.async_api import Page
 
 from ..errors import DiscordMcpError
+from ..logger import logger
+
+# A single 429 must not abort a multi-page walk; the body carries `retry_after`.
+_MAX_RETRIES = 6
+_DEFAULT_RETRY_WAIT = 1.0
+_MAX_RETRY_WAIT = 10.0  # a global limit must not hang a pull
 
 
 class ApiUnavailable(DiscordMcpError):
@@ -62,15 +69,45 @@ class DiscordApiClient:
         payload: dict[str, Any] = {"path": path, "token": token, "method": method}
         if body is not None:
             payload["body"] = json.dumps(body)
-        raw = await self._page.evaluate(_FETCH_JS, payload)
-        resp = ApiResponse(status=int(raw["status"]), body=str(raw["body"]))
-        if resp.status < 200 or resp.status >= 300:
-            raise ApiUnavailable(
-                f"Discord API {method} {path} → {resp.status}: {resp.body[:200]}"
-            )
-        if not resp.body:
-            return None
-        return json.loads(resp.body)
+
+        for attempt in range(_MAX_RETRIES + 1):
+            raw = await self._page.evaluate(_FETCH_JS, payload)
+            resp = ApiResponse(status=int(raw["status"]), body=str(raw["body"]))
+            if resp.status == 429:
+                if attempt >= _MAX_RETRIES:
+                    raise ApiUnavailable(
+                        f"Discord API {method} {path} → 429: rate limited after "
+                        f"{_MAX_RETRIES} retries"
+                    )
+                wait = _retry_after_seconds(resp.body)
+                logger.debug(
+                    f"429 on {method} {path}; "
+                    f"retry {attempt + 1}/{_MAX_RETRIES} after {wait}s"
+                )
+                await asyncio.sleep(wait)
+                continue
+            if resp.status < 200 or resp.status >= 300:
+                raise ApiUnavailable(
+                    f"Discord API {method} {path} → {resp.status}: {resp.body[:200]}"
+                )
+            if not resp.body:
+                return None
+            return json.loads(resp.body)
+
+        raise ApiUnavailable(f"Discord API {method} {path} → exhausted retries")
+
+
+def _retry_after_seconds(body: str) -> float:
+    wait = _DEFAULT_RETRY_WAIT
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict):
+            raw = cast(dict[str, Any], data).get("retry_after")
+            if isinstance(raw, (int, float)):
+                wait = float(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return min(max(wait, 0.0) + 0.1, _MAX_RETRY_WAIT)
 
 
 # Discord removes the `token` key from `window.localStorage` as soon as the

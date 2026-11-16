@@ -59,9 +59,12 @@ class DiscordService:
         hours_back: int,
         max_messages: int,
     ) -> list[Message]:
+        _ = guild_id  # the URL route redirects group DMs to the guild's default channel
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
         all_messages = await self._with_driver(
-            lambda d: d.read_messages(guild_id, channel_id, limit=max_messages)
+            lambda d: d.read_channel_messages_api(
+                channel_id, after=cutoff, limit=max_messages
+            )
         )
         recent = [m for m in all_messages if m.timestamp > cutoff]
         self._remember(recent)
