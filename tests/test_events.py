@@ -65,6 +65,14 @@ class TestRead:
         assert batch.gap is True
         assert buf.read("e:3", query=ALL, limit=10).gap is False
 
+    def test_priority_ring_eviction_reports_gap(self):
+        buf = EventBuffer(maxlen=1, epoch="e")
+        buf.publish(_event("m1", "mention"))
+        buf.publish(_event("m2", "mention"))
+        for query in (EventQuery(), ALL):
+            batch = buf.read("e:0", query=query, limit=10)
+            assert _ids(batch) == ["m2"] and batch.gap is True
+
     def test_reading_from_start_is_never_a_gap(self):
         buf = EventBuffer(maxlen=1, epoch="e")
         buf.publish(_event("1"))
@@ -226,3 +234,13 @@ class TestWait:
         )
         await noisy
         assert len(beats) >= 2
+
+    async def test_cancelled_wait_propagates_and_leaves_buffer_usable(self):
+        buf = EventBuffer(epoch="e")
+        task = asyncio.create_task(buf.wait(None, query=ALL, limit=10, timeout_s=5))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        buf.publish(_event("1"))
+        assert _ids(buf.read(None, query=ALL, limit=10)) == ["1"]

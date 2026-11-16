@@ -200,3 +200,20 @@ class TestEventTools:
         assert out["events"] == [] and out["timed_out"] is True
         assert out["cursor"] == "e:0"
         await listener.close()
+
+    async def test_lifespan_closes_listener_then_service(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from discord_mcp.config import Config
+        from discord_mcp.mcp_server import create_mcp_server
+
+        order: list[str] = []
+        listener = MagicMock()
+        listener.close = AsyncMock(side_effect=lambda: order.append("listener"))
+        service = MagicMock()
+        service.close = AsyncMock(side_effect=lambda: order.append("service"))
+        server = create_mcp_server(service, Config.load(), listener)
+        lowlevel = server._mcp_server
+        async with lowlevel.lifespan(lowlevel):
+            pass
+        assert order == ["listener", "service"]

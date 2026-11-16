@@ -210,6 +210,8 @@ are not included; use `get_mentions` / `read_messages` for history.
 - **Long waits:** `wait_for_events` takes `timeout_s` up to 86,400 and sends an
   MCP progress notification every 30 s while waiting. Your client's own tool
   timeout still applies; in Claude Code raise it with `MCP_TOOL_TIMEOUT` (ms).
+- **Channel filter:** `channel_ids` / `--channel` match the exact channel id; a
+  thread has its own id, so list it separately to include its messages.
 - **Scripts:** `discord-mcp watch [--kinds mention,dm,message] [--channel ID]`
   prints events as JSON lines, e.g. `discord-mcp watch | while read -r e; do …; done`.
 
