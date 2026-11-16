@@ -6,7 +6,7 @@ thin tool here — this file should stay boring on purpose.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -15,9 +15,9 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import Config
 from .errors import DiscordMcpError, InvalidSnowflake, SessionExpired
-from .events import EventBatch, event_filter, parse_kinds
+from .events import EventBatch, EventQuery, parse_kinds
 from .grouping import group_channels, group_conversations
-from .models import Message, MessageEvent, snowflake
+from .models import Message, snowflake
 from .discord import DiscordService
 from .discord.listener import GatewayListener
 from .serialization import event_to_dict
@@ -44,8 +44,10 @@ def create_mcp_server(
         try:
             yield service
         finally:
-            await listener.close()
-            await service.close()
+            try:
+                await listener.close()
+            finally:
+                await service.close()
 
     mcp = FastMCP("discord-mcp", lifespan=lifespan)
 
@@ -318,14 +320,15 @@ def create_mcp_server(
         The first events call starts a background gateway listener; only
         messages arriving after that are seen. `kinds` ⊆ mention, dm, message
         (default mention+dm; "message" is every incoming message). Pass the
-        returned `cursor` as `since` next time.
+        returned `cursor` as `since` next time; `gap` means events after it
+        were evicted unread.
         """
         listener.start()
         try:
-            match, error = _event_query(kinds, channel_ids, limit)
+            query, error = _event_query(kinds, channel_ids, limit)
             if error:
                 return error
-            batch = listener.buffer.read(since, match=match, limit=limit)
+            batch = listener.buffer.read(since, query=query, limit=limit)
         except DiscordMcpError as e:
             return _to_error(e)
         return _batch_dict(batch, listener)
@@ -354,12 +357,12 @@ def create_mcp_server(
             await ctx.report_progress(elapsed, timeout_s, "waiting for Discord events")
 
         try:
-            match, error = _event_query(kinds, channel_ids, limit)
+            query, error = _event_query(kinds, channel_ids, limit)
             if error:
                 return error
             batch = await listener.buffer.wait(
                 since,
-                match=match,
+                query=query,
                 limit=limit,
                 timeout_s=timeout_s,
                 heartbeat=heartbeat,
@@ -442,22 +445,18 @@ def create_mcp_server(
 
 def _event_query(
     kinds: list[str] | None, channel_ids: list[str] | None, limit: int
-) -> tuple[Callable[[MessageEvent], bool], dict[str, Any] | None]:
-    """Build the event filter; a non-None second item is a validation error."""
+) -> tuple[EventQuery, dict[str, Any] | None]:
+    """A non-None second item is a validation error to return as-is."""
     if not 1 <= limit <= MAX_EVENTS_PER_CALL:
-        return _match_none, _validation_error(
+        return EventQuery(), _validation_error(
             f"limit must be between 1 and {MAX_EVENTS_PER_CALL}"
         )
     try:
         parsed = parse_kinds(kinds)
     except ValueError as e:
-        return _match_none, _validation_error(str(e))
-    channels = [snowflake(c, field="channel_ids") for c in channel_ids or []]
-    return event_filter(parsed, channels), None
-
-
-def _match_none(_: MessageEvent) -> bool:
-    return False
+        return EventQuery(), _validation_error(str(e))
+    channels = frozenset(snowflake(c, field="channel_ids") for c in channel_ids or [])
+    return EventQuery(parsed, channels), None
 
 
 def _batch_dict(batch: EventBatch, listener: GatewayListener) -> dict[str, Any]:
@@ -466,12 +465,13 @@ def _batch_dict(batch: EventBatch, listener: GatewayListener) -> dict[str, Any]:
         "events": [event_to_dict(e.event) for e in batch.events],
         "cursor": batch.cursor,
         "timed_out": batch.timed_out,
-        "missed": batch.missed,
+        "gap": batch.gap,
         "reset": batch.reset,
         "listener": {
             "connected": status.connected,
             "restarts": status.restarts,
             "last_error": status.last_error,
+            "session_expired": status.session_expired,
         },
     }
 

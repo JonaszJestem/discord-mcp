@@ -201,8 +201,12 @@ are not included; use `get_mentions` / `read_messages` for history.
   `@everyone`/roles), `dm` (direct or group DM), `message` (every incoming
   message). Default: `mention` + `dm`. Your own messages are skipped.
 - **Cursor:** each response carries `cursor`; pass it back as `since` and no
-  event between calls is lost. `missed > 0` means the 10,000-event buffer
-  overflowed; `reset: true` means the server restarted since the cursor was issued.
+  event between calls is lost. Mentions/DMs and other messages are buffered
+  separately (10,000 each), so busy channels cannot push out a mention.
+  `gap: true` means events after your cursor were evicted unread; `reset: true`
+  means the server restarted since the cursor was issued.
+- **Expired session:** the listener stops and the tools return
+  `discord_session_expired`; run `discord-mcp login` and restart the MCP server.
 - **Long waits:** `wait_for_events` takes `timeout_s` up to 86,400 and sends an
   MCP progress notification every 30 s while waiting. Your client's own tool
   timeout still applies; in Claude Code raise it with `MCP_TOOL_TIMEOUT` (ms).

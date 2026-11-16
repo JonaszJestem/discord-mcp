@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 from discord_mcp.discord.listener import GatewayListener
 from discord_mcp.errors import GatewayStalled, SessionExpired
-from discord_mcp.events import EventBuffer
+from discord_mcp.events import EventBuffer, EventQuery
 from discord_mcp.models import MessageEvent
 
 
@@ -60,11 +60,19 @@ class TestGatewayListener:
         await listener.close()
         assert listener.status().running is False
 
-    async def test_session_expiry_is_flagged(self):
-        rig = _Rig(SessionExpired("gone"))
-        listener = await _run(rig)
+    async def test_session_expiry_stops_for_good(self):
+        rig = _Rig(SessionExpired("gone"), GatewayStalled("never reached"))
+        listener = GatewayListener(rig.factory, EventBuffer(), sleep=rig.sleep)
+        listener.start()
+        for _ in range(20):
+            await asyncio.sleep(0)
         assert listener.status().session_expired is True
-        await listener.close()
+        assert listener.status().running is False
+        listener.start()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(rig.drivers) == 1
+        assert rig.sleeps == []
 
     async def test_failure_wakes_waiters(self):
         rig = _Rig(GatewayStalled("a"))
@@ -77,7 +85,7 @@ class TestGatewayListener:
         waiter = asyncio.create_task(
             listener.buffer.wait(
                 None,
-                match=lambda _: True,
+                query=EventQuery(),
                 limit=1,
                 timeout_s=5,
                 should_stop=should_stop,

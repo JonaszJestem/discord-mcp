@@ -106,3 +106,18 @@ class TestHandlePayload:
             )
             == []
         )
+
+    def test_messages_before_ready_are_dropped(self):
+        events = self._run(
+            {"op": 0, "t": "MESSAGE_CREATE", "d": _msg(author={"id": SELF})},
+        )
+        assert events == []
+
+    def test_message_without_id_is_dropped(self):
+        data = _msg()
+        del data["id"]
+        events = self._run(
+            {"op": 0, "t": "READY", "d": {"user": {"id": SELF}}},
+            {"op": 0, "t": "MESSAGE_CREATE", "d": data},
+        )
+        assert events == []

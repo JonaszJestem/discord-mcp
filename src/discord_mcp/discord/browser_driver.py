@@ -77,12 +77,26 @@ class DiscordBrowserDriver:
     ) -> "DiscordBrowserDriver":
         """Launch a browser with the given session and verify it's still valid."""
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=headless)
-        context = await browser.new_context(storage_state=session)  # type: ignore[arg-type]
-        page = await context.new_page()
+        try:
+            browser = await pw.chromium.launch(headless=headless)
+        except BaseException:
+            await pw.stop()
+            raise
+        try:
+            context = await browser.new_context(storage_state=session)  # type: ignore[arg-type]
+            page = await context.new_page()
+        except BaseException:
+            await browser.close()
+            await pw.stop()
+            raise
         driver = cls(pw, browser, context, page)
 
-        if not await driver._is_logged_in():
+        try:
+            logged_in = await driver._is_logged_in()
+        except BaseException:
+            await driver.close()
+            raise
+        if not logged_in:
             await driver.close()
             raise SessionExpired(
                 "Discord session is invalid or expired. "
@@ -834,6 +848,7 @@ class _GatewayState:
     last_frame: float
     self_id: str | None = None
     failure: str | None = None
+    warned_no_self: bool = False
 
 
 def _handle_payload(
@@ -850,8 +865,14 @@ def _handle_payload(
         return
     if payload.get("t") != "MESSAGE_CREATE":
         return
+    if state.self_id is None:
+        # Without READY, own messages and mentions can't be told apart.
+        if not state.warned_no_self:
+            logger.warning("Gateway message before READY; dropping until known")
+            state.warned_no_self = True
+        return
     kinds = classify(d, state.self_id)
-    if kinds is None:
+    if kinds is None or not isinstance(d.get("id"), str):
         return
     guild_raw = d.get("guild_id")
     guild_id = (

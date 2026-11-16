@@ -25,7 +25,7 @@ from .config import Config
 from .discord import BrowserPool, DiscordBrowserDriver, DiscordService
 from .discord.listener import GatewayListener
 from .errors import DiscordMcpError, SessionExpired
-from .events import EventBuffer, event_filter, parse_kinds
+from .events import EventBuffer, EventQuery, parse_kinds
 from .mcp_server import create_mcp_server
 from .models import SessionData, snowflake
 from .serialization import (
@@ -102,8 +102,9 @@ def _cmd_watch(argv: list[str]) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    channels = [snowflake(c, field="--channel") for c in ns.channel]
-    match = event_filter(kinds, channels)
+    query = EventQuery(
+        kinds, frozenset(snowflake(c, field="--channel") for c in ns.channel)
+    )
     config = Config.load()
     listener = _build_listener(_build_session_store(config).load(), config)
 
@@ -114,14 +115,14 @@ def _cmd_watch(argv: list[str]) -> int:
             while True:
                 batch = await listener.buffer.wait(
                     cursor,
-                    match=match,
+                    query=query,
                     limit=_WATCH_BATCH,
                     timeout_s=_WATCH_WAIT_S,
                     should_stop=lambda: listener.status().session_expired,
                 )
                 cursor = batch.cursor
-                if batch.missed:
-                    print(f"warning: {batch.missed} events dropped", file=sys.stderr)
+                if batch.gap:
+                    print("warning: events were dropped (buffer full)", file=sys.stderr)
                 for item in batch.events:
                     print(json.dumps(event_to_dict(item.event)), flush=True)
                 if not batch.events and listener.status().session_expired:

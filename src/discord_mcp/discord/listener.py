@@ -62,6 +62,8 @@ class GatewayListener:
         self._session_expired = False
 
     def start(self) -> None:
+        if self._session_expired:
+            return
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run(), name="gateway-listener")
 
@@ -78,10 +80,9 @@ class GatewayListener:
         if self._task is None:
             return
         self._task.cancel()
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            pass
+        # asyncio.wait, unlike awaiting the task, lets the caller's own
+        # cancellation propagate instead of swallowing it with the task's.
+        await asyncio.wait([self._task])
         self._task = None
 
     async def _run(self) -> None:
@@ -90,8 +91,13 @@ class GatewayListener:
             started = time.monotonic()
             try:
                 await self._stream_once()
+            except SessionExpired as e:
+                # The server holds the session it started with; retrying only
+                # reloads a logged-out page. A fresh login needs a restart.
+                self._session_expired = True
+                self._record_failure(e)
+                return
             except Exception as e:
-                self._session_expired = isinstance(e, SessionExpired)
                 self._record_failure(e)
             if time.monotonic() - started >= _HEALTHY_RUN_S:
                 backoff = _BACKOFF_START_S
@@ -102,7 +108,6 @@ class GatewayListener:
     async def _stream_once(self) -> None:
         driver = await self._factory()
         self._connected = True
-        self._session_expired = False
         try:
             await driver.stream_gateway(self.buffer.publish, silence_s=self._silence_s)
         finally:
@@ -114,6 +119,6 @@ class GatewayListener:
 
     def _record_failure(self, exc: Exception) -> None:
         self._last_error = f"{type(exc).__name__}: {exc}"
-        logger.warning(f"Gateway listener stopped, restarting: {self._last_error}")
+        logger.warning(f"Gateway listener stopped: {self._last_error}")
         # Wake waiters so a long wait can report a dead session promptly.
         self.buffer.wake()
