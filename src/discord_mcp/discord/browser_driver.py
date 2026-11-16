@@ -353,9 +353,7 @@ class DiscordBrowserDriver:
         await self._ensure_discord_origin()
         collected: list[Message] = []
         seen: set[str] = set()
-        cursor: str | None = (
-            snowflake_for_time(before) if before is not None else None
-        )
+        cursor: str | None = snowflake_for_time(before) if before is not None else None
         for _ in range(_CHANNEL_READ_MAX_PAGES):
             if len(collected) >= limit:
                 break

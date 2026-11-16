@@ -86,7 +86,11 @@ class DiscoveryCache:
 
     def known_people(self) -> list[dict[str, str]]:
         return [
-            {"id": pid, "name": info.get("name", ""), "last_seen": info.get("last_seen", "")}
+            {
+                "id": pid,
+                "name": info.get("name", ""),
+                "last_seen": info.get("last_seen", ""),
+            }
             for pid, info in self._data["people"].items()
         ]
 

@@ -22,15 +22,11 @@ def _msg(mid: str, *, minutes: int) -> Message:
 
 class TestMergeDedupe:
     def test_dedupes_by_id(self):
-        out = _merge_dedupe(
-            [_msg("1", minutes=0)], [_msg("1", minutes=0)], limit=10
-        )
+        out = _merge_dedupe([_msg("1", minutes=0)], [_msg("1", minutes=0)], limit=10)
         assert len(out) == 1
 
     def test_orders_newest_first(self):
-        out = _merge_dedupe(
-            [_msg("1", minutes=0)], [_msg("2", minutes=5)], limit=10
-        )
+        out = _merge_dedupe([_msg("1", minutes=0)], [_msg("2", minutes=5)], limit=10)
         assert [m.id for m in out] == ["2", "1"]
 
     def test_respects_limit(self):
@@ -43,9 +39,7 @@ class TestMergeDedupe:
         assert out[0].id == "3"  # newest kept
 
     def test_merges_thread_only_messages(self):
-        out = _merge_dedupe(
-            [_msg("1", minutes=0)], [_msg("2", minutes=1)], limit=10
-        )
+        out = _merge_dedupe([_msg("1", minutes=0)], [_msg("2", minutes=1)], limit=10)
         assert {m.id for m in out} == {"1", "2"}
 
 

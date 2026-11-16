@@ -59,7 +59,10 @@ class TestMessageFromApi:
         assert msg.author_name == "bob"
 
     def test_prefers_global_name_over_username(self):
-        raw = {"id": "1", "author": {"id": "9", "global_name": "Bob", "username": "bob"}}
+        raw = {
+            "id": "1",
+            "author": {"id": "9", "global_name": "Bob", "username": "bob"},
+        }
         assert _message_from_api(raw, snowflake("1")).author_name == "Bob"
 
     def test_non_numeric_author_id_dropped(self):

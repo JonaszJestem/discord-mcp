@@ -145,9 +145,7 @@ class DiscordService:
             surrounding = await self._with_driver(
                 lambda d: self._context_messages(d, messages)
             )
-            messages = _merge_with_context(
-                messages, surrounding, budget=CONTEXT_BUDGET
-            )
+            messages = _merge_with_context(messages, surrounding, budget=CONTEXT_BUDGET)
         self._remember(messages)
         return messages
 
