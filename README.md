@@ -185,6 +185,7 @@ discord-mcp status   # Show whether a session is stored
 discord-mcp logout   # Delete the encrypted session and keyring key
 discord-mcp serve    # Run the MCP stdio server (MCP clients call this)
 discord-mcp watch    # Print one JSON line per new mention/DM until Ctrl-C
+discord-mcp archive  # Search the local message archive (see below)
 ```
 
 ---
@@ -219,6 +220,39 @@ are not included; use `get_mentions` / `read_messages` for history.
 - **Scripts:** `discord-mcp watch [--kinds mention,dm,message] [--channel ID]`
   prints events as JSON lines, e.g. `discord-mcp watch | while read -r e; do …; done`.
 
+## Local message archive
+
+`discord-mcp watch --archive` also stores every message the gateway delivers,
+from every server, DM and group DM, your own included and regardless of
+`--kinds`/`--channel`. It keeps every edit as a version, records deletions
+without removing anything, and downloads attachments, so a deleted file stays
+recoverable.
+
+- **Where:** `~/discord-archive/` (override with `DISCORD_MCP_ARCHIVE_DIR`):
+  `archive.db` (SQLite) and `attachments/<channel_id>/<message_id>_<filename>`.
+  The directory is `0700` and the files are `0600`.
+- **Downloads** run in the background. Expired links (4xx) are marked
+  `failed`; 5xx, 429 and network errors are retried. Files over 100 MB are
+  skipped. Interrupted downloads resume on the next `watch --archive`.
+
+```bash
+discord-mcp archive search --text invoice --since 7d     # also matches older edit versions
+discord-mcp archive search --channel general --deleted   # channel id or part of its/DM name
+discord-mcp archive search --author tiago --edited --json
+discord-mcp archive show 1300000000000000000            # every version + file paths
+discord-mcp archive stats
+discord-mcp archive retry                               # download failed attachments again
+```
+
+`search` also takes `--guild`, `--until` and `--limit` (newest N, printed
+oldest first). `--since`/`--until` accept `30m`, `24h`, `7d`, `2w` or an ISO
+date/time in UTC.
+
+**Caveat:** only messages the gateway delivers while `watch --archive` runs
+are stored. Nothing is backfilled, and for server channels Discord pushes only
+the channels the web client subscribes to (see above). The archive is local
+and private: it never leaves your machine and must never be committed.
+
 ---
 
 ## Configuration
@@ -232,6 +266,7 @@ All configuration is via environment variables (set in your MCP client config or
 | `DISCORD_POOL_SIZE` | `4` | How many browsers stay warm. Higher = more parallelism, more RAM |
 | `DISCORD_MCP_LOG_LEVEL` | `INFO` | Set to `DEBUG` for verbose logs (goes to stderr) |
 | `XDG_CONFIG_HOME` | `~/.config` | Where `session.enc` lives |
+| `DISCORD_MCP_ARCHIVE_DIR` | `~/discord-archive` | Where `watch --archive` stores messages and attachments |
 
 ---
 

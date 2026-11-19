@@ -17,6 +17,7 @@ from ..errors import SessionExpired
 from ..events import EventBuffer
 from ..logger import logger
 from ..models import MessageEvent
+from .gateway import RawSink
 
 SILENCE_S = 180.0
 _BACKOFF_START_S = 5.0
@@ -27,7 +28,11 @@ _HEALTHY_RUN_S = 60.0
 
 class GatewayDriver(Protocol):
     async def stream_gateway(
-        self, on_event: Callable[[MessageEvent], None], *, silence_s: float
+        self,
+        on_event: Callable[[MessageEvent], None],
+        *,
+        silence_s: float,
+        on_raw: RawSink | None = None,
     ) -> None: ...
 
     async def close(self) -> None: ...
@@ -60,6 +65,11 @@ class GatewayListener:
         self._restarts = 0
         self._last_error: str | None = None
         self._session_expired = False
+        self._raw_sink: RawSink | None = None
+
+    def set_raw_sink(self, sink: RawSink | None) -> None:
+        """Feed every gateway dispatch to `sink`; takes effect on the next stream."""
+        self._raw_sink = sink
 
     def start(self) -> None:
         if self._session_expired:
@@ -109,7 +119,17 @@ class GatewayListener:
         driver = await self._factory()
         self._connected = True
         try:
-            await driver.stream_gateway(self.buffer.publish, silence_s=self._silence_s)
+            if self._raw_sink is None:
+                # Drivers that predate the raw sink don't accept the kwarg.
+                await driver.stream_gateway(
+                    self.buffer.publish, silence_s=self._silence_s
+                )
+            else:
+                await driver.stream_gateway(
+                    self.buffer.publish,
+                    silence_s=self._silence_s,
+                    on_raw=self._raw_sink,
+                )
         finally:
             self._connected = False
             try:

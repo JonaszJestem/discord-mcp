@@ -7,6 +7,7 @@ Subcommands:
     discord-mcp status  — show whether a session is stored
     discord-mcp fetch   — one-shot read, JSON on stdout (for scripts/pollers)
     discord-mcp watch   — stream new messages as JSON lines until interrupted
+    discord-mcp archive — search / inspect the local message archive
 
 All wiring of concrete implementations lives here.
 """
@@ -19,6 +20,8 @@ import json
 import sys
 from collections.abc import Callable
 
+from .archive import MessageArchive
+from .archive_cli import run_archive_cli
 from .auth import AuthService, EncryptedFileSessionStore, OSKeyringVault, SessionStore
 from .cache import DiscoveryCache
 from .config import Config
@@ -26,6 +29,7 @@ from .discord import BrowserPool, DiscordBrowserDriver, DiscordService
 from .discord.listener import GatewayListener
 from .errors import DiscordMcpError, SessionExpired
 from .events import EventBuffer, EventQuery, parse_kinds
+from .logger import logger
 from .mcp_server import create_mcp_server
 from .models import SessionData, snowflake
 from .serialization import (
@@ -60,6 +64,7 @@ def _dispatch(args: list[str]) -> int:
         "status": _cmd_status,
         "fetch": _cmd_fetch,
         "watch": _cmd_watch,
+        "archive": _cmd_archive,
     }
     if not args:
         return _usage()
@@ -71,7 +76,7 @@ def _dispatch(args: list[str]) -> int:
 
 def _usage() -> int:
     print(
-        "usage: discord-mcp {serve | login | logout | status | fetch | watch}",
+        "usage: discord-mcp {serve | login | logout | status | fetch | watch | archive}",
         file=sys.stderr,
     )
     return 2
@@ -107,6 +112,9 @@ def _cmd_watch(argv: list[str]) -> int:
     )
     config = Config.load()
     listener = _build_listener(_build_session_store(config).load(), config)
+    archive = _open_archive(config) if ns.archive else None
+    if archive is not None:
+        listener.set_raw_sink(archive.handle_dispatch)
 
     async def run() -> None:
         listener.start()
@@ -134,7 +142,19 @@ def _cmd_watch(argv: list[str]) -> int:
         asyncio.run(run())
     except KeyboardInterrupt:
         pass
+    finally:
+        if archive is not None:
+            archive.close()
     return 0
+
+
+def _open_archive(config: Config) -> MessageArchive | None:
+    try:
+        return MessageArchive(config.archive_dir)
+    except Exception as e:
+        # The archive is a side channel; watch output must not depend on it.
+        logger.error(f"Message archive unavailable, watching without it: {e!r}")
+        return None
 
 
 def _watch_parser() -> argparse.ArgumentParser:
@@ -152,6 +172,11 @@ def _watch_parser() -> argparse.ArgumentParser:
         default=[],
         help="only this channel id (repeatable)",
     )
+    parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="also store every message the gateway delivers in the local archive",
+    )
     return parser
 
 
@@ -160,6 +185,10 @@ def _build_listener(session: SessionData, config: Config) -> GatewayListener:
         return await DiscordBrowserDriver.create(session, headless=config.headless)
 
     return GatewayListener(driver_factory, EventBuffer())
+
+
+def _cmd_archive(argv: list[str]) -> int:
+    return run_archive_cli(argv, Config.load().archive_dir)
 
 
 def _cmd_login(_: list[str]) -> int:

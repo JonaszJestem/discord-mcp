@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import pathlib as pl
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -28,6 +28,7 @@ class Config:
     headless: bool
     read_only: bool
     pool_size: int
+    archive_dir: pl.Path = field(default_factory=lambda: _archive_dir(None))
 
     @classmethod
     def load(cls) -> "Config":
@@ -43,7 +44,14 @@ class Config:
             headless=_env_bool("DISCORD_HEADLESS", default=True),
             read_only=_env_bool("DISCORD_READ_ONLY", default=True),
             pool_size=_env_int("DISCORD_POOL_SIZE", default=4, minimum=1),
+            archive_dir=_archive_dir(os.getenv("DISCORD_MCP_ARCHIVE_DIR")),
         )
+
+
+def _archive_dir(raw: str | None) -> pl.Path:
+    if raw and raw.strip():
+        return pl.Path(raw.strip()).expanduser()
+    return pl.Path.home() / "discord-archive"
 
 
 def _config_file(name: str) -> pl.Path:

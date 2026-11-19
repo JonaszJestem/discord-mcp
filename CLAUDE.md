@@ -28,11 +28,15 @@ src/discord_mcp/
 │   ├── browser_pool.py    # Generic BrowserPool[T: Closable]; broken-eviction
 │   ├── browser_driver.py  # Only place that talks to Playwright/Discord DOM
 │   └── service.py         # DiscordService: use cases, pool discipline
+├── archive.py             # MessageArchive: raw dispatches → SQLite + attachment downloads
+├── archive_cli.py         # `discord-mcp archive` search/show/stats/retry
 ├── cli.py                 # Subcommand dispatch + composition root
 └── mcp_server.py          # Thin FastMCP wiring
 ```
 
 Dependencies go **inward**: `mcp_server` → `DiscordService` → `BrowserPool` + `DiscordBrowserDriver`. Nothing in `domain`, `auth`, or `discord/service` imports from `mcp_server` or `cli`.
+
+The archive hangs off the listener, not the event buffer: `GatewayListener.set_raw_sink(archive.handle_dispatch)` → `stream_gateway(on_raw=...)` → `_handle_payload` feeds every raw dispatch before the kind/own-message filter. `handle_dispatch` never raises; a broken archive must not stop `watch`.
 
 ## CLI entry points
 
@@ -41,7 +45,8 @@ discord-mcp serve    # MCP stdio server — what MCP clients invoke
 discord-mcp login    # Headful browser; user signs in; session encrypted + saved
 discord-mcp logout   # Clear session file + keyring key
 discord-mcp status   # Report whether a session is stored
-discord-mcp watch    # Stream new mentions/DMs as JSON lines
+discord-mcp watch    # Stream new mentions/DMs as JSON lines (--archive: store everything locally)
+discord-mcp archive  # Search/show/stats/retry over the local archive
 ```
 
 ## Tooling

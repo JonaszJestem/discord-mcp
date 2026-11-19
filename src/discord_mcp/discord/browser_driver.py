@@ -41,7 +41,13 @@ from ..models import (
     time_for_snowflake,
 )
 from .api_client import ApiUnavailable, DiscordApiClient
-from .gateway import GATEWAY_HOST, OP_DISPATCH, ZlibStreamDecoder, classify
+from .gateway import (
+    GATEWAY_HOST,
+    OP_DISPATCH,
+    RawSink,
+    ZlibStreamDecoder,
+    classify,
+)
 
 
 _LOGGED_IN_SELECTOR = '[data-list-id="guildsnav"] [role="treeitem"]'
@@ -617,7 +623,11 @@ class DiscordBrowserDriver:
         await asyncio.sleep(1)
 
     async def stream_gateway(
-        self, on_event: Callable[[MessageEvent], None], *, silence_s: float
+        self,
+        on_event: Callable[[MessageEvent], None],
+        *,
+        silence_s: float,
+        on_raw: RawSink | None = None,
     ) -> None:
         """Feed each incoming message to `on_event`; only returns by raising.
 
@@ -639,7 +649,7 @@ class DiscordBrowserDriver:
                 try:
                     payload = decoder.feed(frame)
                     if payload is not None:
-                        _handle_payload(payload, state, on_event)
+                        _handle_payload(payload, state, on_event, on_raw)
                 except (zlib.error, ValueError) as e:
                     state.failure = f"undecodable gateway frame: {e}"
                 except Exception as e:
@@ -855,9 +865,17 @@ def _handle_payload(
     payload: dict[str, Any],
     state: _GatewayState,
     on_event: Callable[[MessageEvent], None],
+    on_raw: RawSink | None = None,
 ) -> None:
+    if payload.get("op") != OP_DISPATCH:
+        return
+    if on_raw is not None:
+        try:
+            on_raw(payload)
+        except Exception as e:
+            logger.warning(f"Gateway raw sink failed: {e!r}")
     data = payload.get("d")
-    if payload.get("op") != OP_DISPATCH or not isinstance(data, dict):
+    if not isinstance(data, dict):
         return
     d = cast(dict[str, Any], data)
     if payload.get("t") == "READY":

@@ -10,6 +10,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch):
         "DISCORD_READ_ONLY",
         "DISCORD_POOL_SIZE",
         "XDG_CONFIG_HOME",
+        "DISCORD_MCP_ARCHIVE_DIR",
     ]:
         monkeypatch.delenv(k, raising=False)
 
@@ -61,3 +62,12 @@ class TestConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("DISCORD_POOL_SIZE", "not-a-number")
         assert Config.load().pool_size == 4
+
+    def test_archive_dir_default_and_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert Config.load().archive_dir == tmp_path / "discord-archive"
+        monkeypatch.setenv("DISCORD_MCP_ARCHIVE_DIR", "~/elsewhere")
+        assert Config.load().archive_dir == tmp_path / "elsewhere"

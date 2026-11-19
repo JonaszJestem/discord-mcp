@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import zlib
+from collections.abc import Callable
 from typing import Any, cast
 
 from ..models import EventKind
@@ -16,6 +17,9 @@ from ..models import EventKind
 GATEWAY_HOST = "gateway.discord.gg"
 _ZLIB_SUFFIX = b"\x00\x00\xff\xff"
 OP_DISPATCH = 0
+
+RawSink = Callable[[dict[str, Any]], None]
+"""Receives every dispatch payload, before any filtering."""
 
 
 class ZlibStreamDecoder:
