@@ -8,13 +8,15 @@ of silently skipping or replaying events.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import heapq
 import re
 import secrets
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from dataclasses import dataclass
+from itertools import islice
 from typing import cast, get_args
 
 from .errors import InvalidCursor
@@ -22,6 +24,7 @@ from .models import EventKind, MessageEvent, Snowflake
 
 DEFAULT_BUFFER_SIZE = 10_000
 HEARTBEAT_S = 30.0
+_MIN_WAIT_S = 0.01
 
 EVENT_KINDS: tuple[EventKind, ...] = get_args(EventKind)
 DEFAULT_KINDS: frozenset[EventKind] = frozenset({"mention", "dm"})
@@ -119,8 +122,9 @@ class EventBuffer:
         gap = since is not None and any(r.evicted_upto > since_seq for r in rings)
         picked: list[SequencedEvent] = []
         cursor_seq = self._seq
-        for item in heapq.merge(*(r.items for r in rings), key=lambda i: i.seq):
-            if item.seq <= since_seq or not query.matches(item.event):
+        unread = (_after(r.items, since_seq) for r in rings)
+        for item in heapq.merge(*unread, key=lambda i: i.seq):
+            if not query.matches(item.event):
                 continue
             picked.append(item)
             if len(picked) == limit:
@@ -164,11 +168,12 @@ class EventBuffer:
             if heartbeat is not None and now >= next_beat:
                 await heartbeat(now - started)
                 next_beat = now + HEARTBEAT_S
+            wake_at = deadline if heartbeat is None else min(deadline, next_beat)
+            # A slow heartbeat can leave wake_at in the past; never spin on it.
+            wait_s = max(_MIN_WAIT_S, wake_at - time.monotonic())
             changed = self._changed
             try:
-                await asyncio.wait_for(
-                    changed.wait(), min(deadline, next_beat) - time.monotonic()
-                )
+                await asyncio.wait_for(changed.wait(), wait_s)
             except TimeoutError:
                 pass
             batch = self.read(batch.cursor, query=query, limit=limit)
@@ -186,6 +191,11 @@ class EventBuffer:
         if seq > self._seq:
             raise InvalidCursor(f"cursor {cursor!r} is ahead of this stream")
         return seq, False
+
+
+def _after(items: deque[SequencedEvent], seq: int) -> Iterator[SequencedEvent]:
+    start = bisect.bisect_right(items, seq, key=lambda i: i.seq)
+    return islice(items, start, None)
 
 
 def _with_flags(batch: EventBatch, first: EventBatch, *, timed_out: bool) -> EventBatch:

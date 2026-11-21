@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -177,6 +178,24 @@ class TestWait:
         assert batch.timed_out
         assert len(beats) >= 3
         assert beats == sorted(beats)
+
+    async def test_idle_wait_without_heartbeat_does_not_spin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(events_mod, "HEARTBEAT_S", 0.01)
+        buf = EventBuffer(epoch="e")
+        reads = 0
+        real_read = buf.read
+
+        def counting_read(*args: Any, **kwargs: Any) -> events_mod.EventBatch:
+            nonlocal reads
+            reads += 1
+            return real_read(*args, **kwargs)
+
+        monkeypatch.setattr(buf, "read", counting_read)
+        batch = await buf.wait(None, query=ALL, limit=10, timeout_s=0.2)
+        assert batch.timed_out
+        assert reads <= 3
 
     async def test_every_concurrent_waiter_receives_the_event(self):
         buf = EventBuffer(epoch="e")
